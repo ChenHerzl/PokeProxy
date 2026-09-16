@@ -1,0 +1,19 @@
+{
+  "rules": [
+    {
+      "url": "http://localhost:8001/pokemon",
+      "reason": "strong fire pokemon",
+      "match": ["type_one==Fire", "attack>80", "generation<4"]
+    },
+    {
+      "url": "http://localhost:8001/pokemon",
+      "reason": "legendary pokemon",
+      "match": ["legendary==true"]
+    },
+    {
+      "url": "http://localhost:8001/pokemon",
+      "reason": "tanky pokemon",
+      "match": ["defense>100", "hit_points>80"]
+    }
+  ]
+}
