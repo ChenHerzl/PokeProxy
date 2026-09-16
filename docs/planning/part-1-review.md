@@ -1,5 +1,9 @@
 # Part 1 planning — operational code review
 
+> Historical record. Current status and Prometheus/Grafana direction are documented
+> in [production hardening](../planning/02-production-hardening.md).
+
+
 ## Goal and scope
 
 The user requested a code review and documented findings as the first step of

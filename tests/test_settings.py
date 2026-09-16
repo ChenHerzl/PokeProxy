@@ -61,6 +61,10 @@ def test_missing_secret_rejected():
 def test_example_dotenv_starts_application():
     example = Path(__file__).resolve().parents[1] / ".env.example"
     Path(".env").write_text(example.read_text())
+    Path("config").mkdir()
+    Path("config/rules.json").write_text(
+        (example.parent / "config/rules.json").read_text()
+    )
     with TestClient(app) as client:
         assert app.state.hmac_key == Settings().hmac_key
         assert client.get("/health").json() == {"status": "alive"}

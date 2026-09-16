@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pokeproxy.config import MatchCondition, Operator, PokemonJSON, Rule
 
@@ -109,27 +110,61 @@ def match_pokemon(pokemon: PokemonJSON, rules: list[Rule]) -> Rule | None:
 
 def load_rules(config_path: str) -> list[Rule]:
     """Load and validate rules from a JSON config file."""
-    path = Path(config_path)
-    data = json.loads(path.read_text())
-
-    raw_rules: list[dict[str, object]] = data.get("rules", [])
-    rules: list[Rule] = []
-
-    for raw_rule in raw_rules:
-        url = str(raw_rule.get("url", ""))
-        if not url.startswith(("http://", "https://")):
-            raise ValueError(f"Invalid rule URL: {url!r} — must start with http(s)://")
-
-        reason = str(raw_rule.get("reason", ""))
-        match_exprs = raw_rule.get("match", [])
-        if not isinstance(match_exprs, list):
+    try:
+        data = json.loads(Path(config_path).read_text())
+    except (OSError, ValueError):
+        raise ValueError(
+            "Routing configuration must be a readable UTF-8 JSON file"
+        ) from None
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"rules"}
+        or not isinstance(data["rules"], list)
+    ):
+        raise ValueError(
+            "Routing configuration requires a 'rules' list and no unknown fields"
+        )
+    rules = []
+    for index, raw in enumerate(data["rules"]):
+        field = "schema (url, reason, match required)"
+        try:
+            if not isinstance(raw, dict) or set(raw) != {"url", "reason", "match"}:
+                raise ValueError("required fields are url, reason, match")
+            url, reason, expressions = raw["url"], raw["reason"], raw["match"]
+            field = "url (HTTP(S) host without credentials/fragment)"
+            if not isinstance(url, str) or any(c.isspace() or ord(c) < 32 for c in url):
+                raise ValueError("URL must be an HTTP(S) string without whitespace")
+            parsed = urlsplit(url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+                or (parsed.port is not None and parsed.port < 1)
+            ):
+                raise ValueError(
+                    "URL requires an HTTP(S) host and no credentials or fragment"
+                )
+            field = "reason (printable ASCII, at most 1024 characters)"
+            if (
+                not isinstance(reason, str)
+                or len(reason) > 1024
+                or any(ord(c) < 32 or ord(c) > 126 for c in reason)
+            ):
+                raise ValueError("reason must be printable ASCII")
+            field = "match (nonempty list of valid condition strings)"
+            if (
+                not isinstance(expressions, list)
+                or not expressions
+                or not all(isinstance(e, str) for e in expressions)
+            ):
+                raise ValueError("match must be a nonempty list of strings")
+            conditions = [parse_condition(e) for e in expressions]
+            rules.append(Rule(url=url, reason=reason, conditions=conditions))
+        except (ValueError, TypeError):
+            # Never include URLs, credentials, or raw configuration in startup errors.
             raise ValueError(
-                f"'match' must be a list, got {type(match_exprs).__name__}"
-            )
-        if not match_exprs:
-            raise ValueError("Rule must have at least one match condition")
-
-        conditions = [parse_condition(str(expr)) for expr in match_exprs]
-        rules.append(Rule(url=url, reason=reason, conditions=conditions))
-
+                f"Invalid routing rule at index {index}: {field}"
+            ) from None
     return rules

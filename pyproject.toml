@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.28",
     "pydantic-settings>=2.7",
     "protobuf>=6.31.1",
+    "prometheus-client>=0.21",
     "redis[hiredis]>=5.0",
 ]
 

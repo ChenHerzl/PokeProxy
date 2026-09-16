@@ -1,8 +1,8 @@
-from __future__ import annotations
+"""Bounded per-process metrics; use one worker per process and aggregate externally."""
 
-import bisect
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 
 @dataclass
@@ -12,45 +12,61 @@ class EndpointStats:
     total_response_time: float = 0.0
     bytes_received: int = 0
     bytes_sent: int = 0
-    _response_times: list[float] = field(default_factory=list)
 
-    def record_response_time(self, elapsed: float) -> None:
-        self.total_response_time += elapsed
-        bisect.insort(self._response_times, elapsed)
-
-    @property
-    def avg_response_time(self) -> float:
-        return (
-            self.total_response_time / self.request_count if self.request_count else 0.0
-        )
-
-    @property
-    def error_rate(self) -> float:
-        return self.error_count / self.request_count if self.request_count else 0.0
-
-    def percentile(self, p: float) -> float:
-        if not self._response_times:
-            return 0.0
-        idx = int(len(self._response_times) * p / 100)
-        idx = min(idx, len(self._response_times) - 1)
-        return self._response_times[idx]
-
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict:
         return {
             "request_count": self.request_count,
             "error_count": self.error_count,
-            "error_rate": round(self.error_rate, 4),
+            "error_rate": self.error_count / self.request_count
+            if self.request_count
+            else 0,
             "bytes_received": self.bytes_received,
             "bytes_sent": self.bytes_sent,
+            "avg_response_time": self.total_response_time / self.request_count
+            if self.request_count
+            else 0,
         }
 
 
-@dataclass
 class StatsRegistry:
-    endpoints: dict[str, EndpointStats] = field(default_factory=dict)
+    def __init__(self):
+        self.registry = CollectorRegistry()
+        self.endpoints: dict[str, EndpointStats] = {}
+        self.requests = Counter(
+            "pokeproxy_requests_total",
+            "Completed stream requests",
+            ["outcome", "status"],
+            registry=self.registry,
+        )
+        self.duration = Histogram(
+            "pokeproxy_request_duration_seconds",
+            "Stream duration",
+            registry=self.registry,
+        )
+        self.forward = Counter(
+            "pokeproxy_forward_total",
+            "Single downstream attempts",
+            ["rule", "outcome"],
+            registry=self.registry,
+        )
+        self.forward_duration = Histogram(
+            "pokeproxy_forward_duration_seconds",
+            "Downstream duration",
+            ["rule"],
+            registry=self.registry,
+        )
+        self.cache = Counter(
+            "pokeproxy_cache_total",
+            "Cache operations",
+            ["outcome"],
+            registry=self.registry,
+        )
+        self.inflight = Gauge(
+            "pokeproxy_inflight", "Admitted stream requests", registry=self.registry
+        )
 
-    def get(self, url: str) -> EndpointStats:
-        return self.endpoints.setdefault(url, EndpointStats())
+    def get(self, rule_id: str) -> EndpointStats:
+        return self.endpoints.setdefault(rule_id, EndpointStats())
 
-    def to_dict(self) -> dict[str, Any]:
-        return {url: stats.to_dict() for url, stats in self.endpoints.items()}
+    def to_dict(self) -> dict:
+        return {rule: value.to_dict() for rule, value in self.endpoints.items()}

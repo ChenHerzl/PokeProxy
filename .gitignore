@@ -37,3 +37,8 @@ dump.rdb
 # OS
 .DS_Store
 Thumbs.db
+
+# Local secrets (keep the public example)
+.env.*
+!.env.example
+.secrets/

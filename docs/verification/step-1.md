@@ -1,5 +1,9 @@
 # Step 1 — startup and dependency baseline
 
+> Historical record. Current status and Prometheus/Grafana direction are documented
+> in [production hardening](../planning/02-production-hardening.md).
+
+
 Completed: 2026-09-16. Scope: findings 004 and 012, plus the test baseline.
 
 ## Deliverables

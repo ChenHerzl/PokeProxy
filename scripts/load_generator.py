@@ -15,6 +15,8 @@ import argparse
 import base64
 import hashlib
 import hmac
+import math
+import os
 import random
 import sys
 import time
@@ -68,15 +70,34 @@ def sign_payload(secret: bytes, body: bytes) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PokeProxy load generator")
-    parser.add_argument("--url", default="http://localhost:8000/stream", help="Target URL")
+    parser.add_argument(
+        "--url", default="http://localhost:8000/stream", help="Target URL"
+    )
     parser.add_argument("--rps", type=float, default=10.0, help="Requests per second")
-    parser.add_argument("--duration", type=int, default=60, help="Duration in seconds (0 = infinite)")
-    parser.add_argument("--secret", default="bG9jYWwtZGV2ZWxvcG1lbnQtb25seS1zZWNyZXQtMzIh", help="Base64-encoded HMAC secret")
+    parser.add_argument(
+        "--duration", type=int, default=60, help="Duration in seconds (0 = infinite)"
+    )
+    parser.add_argument(
+        "--secret",
+        default=os.environ.get(
+            "POKEPROXY_SECRET", "bG9jYWwtZGV2ZWxvcG1lbnQtb25seS1zZWNyZXQtMzIh"
+        ),
+        help="Base64 HMAC key; prefer POKEPROXY_SECRET to avoid argv exposure",
+    )
     args = parser.parse_args()
 
-    secret = base64.b64decode(args.secret)
+    if not math.isfinite(args.rps) or args.rps <= 0 or args.duration < 0:
+        parser.error("rps must be finite and positive; duration must be nonnegative")
+    try:
+        secret = base64.b64decode(args.secret, validate=True)
+        if len(secret) < 32:
+            raise ValueError
+    except ValueError:
+        parser.error("secret must be valid base64 encoding at least 32 bytes")
     interval = 1.0 / args.rps
-    end_time = time.time() + args.duration if args.duration > 0 else float("inf")
+    started = time.monotonic()
+    end_time = started + args.duration if args.duration > 0 else float("inf")
+    next_send = started
 
     print(f"Sending traffic to {args.url} at ~{args.rps} rps")
     if args.duration > 0:
@@ -88,7 +109,7 @@ def main() -> None:
     errors = 0
 
     with httpx.Client(timeout=10.0) as client:
-        while time.time() < end_time:
+        while time.monotonic() < end_time:
             data = random.choice(POKEMON_DATA)
             body = make_pokemon_proto(data)
             signature = sign_payload(secret, body)
@@ -113,11 +134,20 @@ def main() -> None:
                 errors += 1
                 sent += 1
                 if sent % 50 == 0:
-                    print(f"  [{sent}] ERROR: {e}")
+                    print(f"  [{sent}] ERROR: {type(e).__name__}")
 
-            time.sleep(interval)
+            next_send = max(next_send + interval, time.monotonic())
+            time.sleep(max(0, min(next_send, end_time) - time.monotonic()))
 
-    print(f"\nDone. Sent: {sent}, Errors: {errors}, Error rate: {errors/sent*100:.1f}%" if sent else "\nNo requests sent.")
+    print(
+        f"\nDone. Sent: {sent}, Errors: {errors}, Error rate: {errors / sent * 100:.1f}%"
+        if sent
+        else "\nNo requests sent."
+    )
+
+    print(f"Achieved rate: {sent / max(time.monotonic() - started, 0.001):.2f} rps")
+    if errors:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

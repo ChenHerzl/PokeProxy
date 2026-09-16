@@ -1,36 +1,56 @@
 from __future__ import annotations
 
-import json
-from typing import TYPE_CHECKING
+import asyncio
 
-if TYPE_CHECKING:
-    import redis.asyncio as aioredis
+from redis.exceptions import RedisError
 
-    from pokeproxy.config import PokemonJSON
-
-CACHE_TTL = 300  # 5 minutes
-
-
-async def get_cached_pokemon(
-    redis: aioredis.Redis, cache_key: str
-) -> dict | None:
-    """Fetch a cached Pokemon JSON dict from Redis."""
-    keys = await redis.keys("pokeproxy:pokemon:*")
-    for key in keys:
-        if (key.decode() if isinstance(key, bytes) else key) == cache_key:
-            data = await redis.get(key)
-            if data is not None:
-                return json.loads(data)
-    return None
-
-
-async def cache_pokemon(
-    redis: aioredis.Redis, cache_key: str, pokemon: PokemonJSON
-) -> None:
-    """Cache a Pokemon JSON representation in Redis."""
-    await redis.set(cache_key, pokemon.model_dump_json(), ex=CACHE_TTL)
+from pokeproxy.config import PokemonJSON
+from pokeproxy.logging import event
 
 
 def make_cache_key(body_hash: str) -> str:
-    """Create a cache key from a body hash."""
     return f"pokeproxy:pokemon:{body_hash}"
+
+
+class PokemonCache:
+    def __init__(self, redis, settings, stats):
+        self.redis, self.settings, self.stats = redis, settings, stats
+        self.healthy: bool | None = None
+
+    def failure(self, operation: str, error: Exception, request_id: str) -> None:
+        self.healthy = False
+        self.stats.cache.labels(f"{operation}_error").inc()
+        event(
+            "cache_degraded",
+            operation=operation,
+            error_type=type(error).__name__,
+            request_id=request_id,
+        )
+
+    async def get(self, key: str, request_id: str) -> PokemonJSON | None:
+        try:
+            async with asyncio.timeout(self.settings.pokeproxy_redis_timeout):
+                data = await self.redis.get(key)
+            self.healthy = True
+            if data is None:
+                self.stats.cache.labels("miss").inc()
+                return None
+            pokemon = PokemonJSON.model_validate_json(data, strict=True)
+            if not pokemon.name:
+                raise ValueError("empty cached name")
+            self.stats.cache.labels("hit").inc()
+            return pokemon
+        except (RedisError, TimeoutError, ValueError, TypeError) as exc:
+            self.failure("read", exc, request_id)
+            return None
+
+    async def put(self, key: str, pokemon: PokemonJSON, request_id: str) -> None:
+        try:
+            async with asyncio.timeout(self.settings.pokeproxy_redis_timeout):
+                await self.redis.set(
+                    key, pokemon.model_dump_json(), ex=self.settings.pokeproxy_cache_ttl
+                )
+            self.healthy = True
+            self.stats.cache.labels("write").inc()
+        except (RedisError, TimeoutError) as exc:
+            self.failure("write", exc, request_id)

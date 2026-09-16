@@ -3,9 +3,10 @@ from __future__ import annotations
 import base64
 import binascii
 from typing import Literal
+from urllib.parse import urlsplit
 
 from google.protobuf.message import DecodeError
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from pokeproxy.proto import pokemon_pb2
@@ -18,7 +19,38 @@ class Settings(BaseSettings):
 
     pokeproxy_secret: SecretStr
     pokeproxy_config: str
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
+    pokeproxy_http_timeout: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    pokeproxy_downstream_deadline: float = Field(
+        default=10.0, gt=0, allow_inf_nan=False
+    )
+    pokeproxy_upload_timeout: float = Field(default=10.0, gt=0, allow_inf_nan=False)
+    pokeproxy_redis_timeout: float = Field(default=0.25, gt=0, allow_inf_nan=False)
+    pokeproxy_cache_ttl: int = Field(default=300, gt=0)
+    pokeproxy_max_body_bytes: int = Field(default=1_048_576, gt=0)
+    pokeproxy_max_response_bytes: int = Field(default=1_048_576, gt=0)
+    pokeproxy_max_inflight: int = Field(default=100, gt=0)
+    pokeproxy_close_timeout: float = Field(default=2.0, gt=0, allow_inf_nan=False)
+
+    @field_validator("redis_url")
+    @classmethod
+    def validate_redis_url(cls, value: SecretStr) -> SecretStr:
+        try:
+            url = urlsplit(value.get_secret_value())
+            if (
+                url.scheme not in {"redis", "rediss"}
+                or not url.hostname
+                or url.query
+                or url.fragment
+                or (url.port is not None and url.port < 1)
+                or (url.path not in {"", "/"} and not url.path[1:].isdigit())
+            ):
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                "REDIS_URL must be redis(s)://host[:port][/database], without query options"
+            ) from None
+        return value
 
     @field_validator("pokeproxy_secret")
     @classmethod

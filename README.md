@@ -37,10 +37,11 @@ cp .env.example .env
 redis-server &
 
 # Start the mock downstream service
-uv run uvicorn mock_service.main:app --host 127.0.0.1 --port 8001 &
+uv run --frozen uvicorn mock_service.main:app --host 127.0.0.1 --port 8001 &
 
 # Start PokeProxy
-uv run uvicorn pokeproxy.main:app --host 127.0.0.1 --port 8000
+uv run --frozen uvicorn pokeproxy.main:app --host 127.0.0.1 --port 8000 \
+  --workers 1 --limit-concurrency 200 --timeout-graceful-shutdown 30
 ```
 
 ## Configuration
@@ -81,14 +82,16 @@ Rules are loaded from the JSON file specified by `POKEPROXY_CONFIG`.
 |----------|--------|-------------|
 | `/stream` | POST | Proxy endpoint — validates, matches, forwards |
 | `/health` | GET | Health check |
-| `/stats` | GET | Per-endpoint metrics |
+| `/ready` | GET | Initialized readiness and last cache operation health |
+| `/stats` | GET | Per-rule cumulative forwarding summary |
+| `/metrics` | GET | Prometheus application metrics |
 
 ## Load Generator
 
 A load generator script is included to send synthetic Pokemon traffic:
 
 ```bash
-uv run python scripts/load_generator.py --rps 10 --duration 60
+uv run --frozen python scripts/load_generator.py --rps 10 --duration 60
 ```
 
 Options:
@@ -131,3 +134,130 @@ and rerun tests after changing the schema.
 See [step 1 verification](docs/verification/step-1.md) for results and scope,
 [review findings](docs/issues/README.md) for remaining work, and
 [planning decisions](docs/planning/part-1-review.md).
+
+
+## Production hardening (Part 1)
+
+See [implemented decisions and results](docs/planning/02-production-hardening.md)
+and [individual issue records](docs/issues/README.md). Kubernetes, CI/CD and the
+Prometheus/Grafana deployment are subsequent work.
+
+The proxy validates configuration before serving requests. Rules are read once;
+restart after changing the file. Top-level JSON must contain only `rules`, and
+rules require `url`, `reason`, and `match`. An explicitly empty list is allowed;
+a missing list is an error. Reasons must be printable ASCII, at most 1024
+characters. URLs need an HTTP(S) host and cannot contain credentials or fragments.
+AND conditions, first match, numeric JSON fields, and unmatched HTTP 200 `{}` are
+unchanged. Cache hits still forward: Redis avoids decoding, not delivery.
+
+Forwarding uses one pooled HTTP request, with no automatic POST retry. Timeouts
+return 504, transport/oversized-response failures return 502. Ambiguous failures
+can occur after downstream acceptance; caller retries can still duplicate work.
+Responses preserve raw downstream bytes and Content-Encoding while recalculating
+Content-Length; the response limit applies to encoded bytes, not decompressed
+client memory. Hop-by-hop metadata and proxy-owned request headers are filtered.
+The HTTP pool does not retain cookies between callers and ignores environment
+proxy settings (`trust_env=False`). Configure routing URLs explicitly.
+
+Redis is a best-effort decoded-data cache. Read/write errors and corrupt entries
+fall back to decoding/forwarding within a per-operation budget. Redis URL query
+options are forbidden so they cannot override timeouts/pool settings. Redis must
+be trusted and network-restricted: schema validation does not authenticate cached
+content against the original signed payload.
+
+### Operational settings
+
+All application limits are positive and loaded from the environment or `.env`.
+Non-finite time values are rejected. Environment values take precedence.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `POKEPROXY_HTTP_TIMEOUT` | 5 | Each HTTP connect/read/write/pool inactivity timeout, seconds |
+| `POKEPROXY_DOWNSTREAM_DEADLINE` | 10 | Total downstream attempt budget, seconds |
+| `POKEPROXY_UPLOAD_TIMEOUT` | 10 | Total request body read budget, seconds |
+| `POKEPROXY_REDIS_TIMEOUT` | 0.25 | Total budget for each Redis read or write, seconds |
+| `POKEPROXY_CACHE_TTL` | 300 | Cached decoded JSON TTL, seconds |
+| `POKEPROXY_MAX_BODY_BYTES` | 1048576 | Maximum accumulated inbound protobuf bytes |
+| `POKEPROXY_MAX_RESPONSE_BYTES` | 1048576 | Maximum raw downstream response bytes |
+| `POKEPROXY_MAX_INFLIGHT` | 100 | Concurrent admitted `/stream` handlers and client pool capacities |
+| `POKEPROXY_CLOSE_TIMEOUT` | 2 | Budget for closing each shared client, seconds |
+
+Admission rejects excess work immediately with 503. The application cap ends when
+its handler returns; Uvicorn's separate concurrency limit also bounds outstanding
+ASGI responses/slow clients. Run one worker per process; metrics, admission, and
+mock receipts are process-local. Choose limits from measured capacity rather than
+assuming these defaults are a production sizing result.
+
+### Health, termination and diagnostics
+
+`/health` reports the live process. `/ready` requires completed initialization;
+cache health is `unknown`, `healthy`, or `degraded` based on the last operation,
+not a continuous connectivity probe. Cache/downstream outages do not fail liveness
+or automatically remove a functioning proxy from service.
+
+Uvicorn handles SIGTERM/SIGINT: it stops accepting connections, drains in-flight
+work, then exits the lifespan and closes clients. Do not install a competing
+application signal handler. Use a finite graceful-shutdown timeout; the example
+30 seconds covers the default 10-second upload, two 0.25-second cache operations,
+and 10-second downstream budget. Each client close adds up to 2 seconds; allow
+additional process termination grace outside Uvicorn. Raising budgets requires
+revisiting this timing. Shutdown tests cover both signals during a hung downstream.
+
+Application logs are JSON on stdout with event, safe request ID, outcome and
+context. HTTP responses include `X-Request-ID`; generated error JSON also includes
+`request_id`. IDs are correlation data, not authenticated identities. Arbitrary
+client IDs are accepted only within the documented safe character/length bounds.
+Raw payloads, signatures, keys, exception text and destination URLs are omitted.
+Uvicorn's own server/access logs retain its standard format. `/metrics`, `/stats`
+and mock administration endpoints should be private in the later deployment.
+
+`/metrics` exports request/forwarding counters, duration histograms in seconds,
+cache outcome counters and current admitted work. Labels are bounded outcomes,
+statuses and `rule_0`, `rule_1`, etc. Rule indices refer to the startup ordering;
+reordering rules changes their meaning across releases. `/stats` now uses these
+IDs instead of URLs. `bytes_sent` counts attempted JSON payload bytes, not proven
+socket delivery. Infrastructure CPU/memory collection, scraping, dashboards and
+alerts are not implemented in Part 1.
+
+### Mock and end-to-end verification
+
+The mock requires one worker. It retains at most `MOCK_MAX_RECEIPTS` (default
+1000); `MOCK_MAX_BODY_BYTES` defaults to 1048576 and `MOCK_UPLOAD_TIMEOUT` to 10
+seconds. These are environment settings, loaded at startup. Receipt state is lost
+on restart, and old receipts are evicted; size the retention for demonstration
+traffic. GET `/received?request_id=...` isolates a run. DELETE remains available
+for manual reset, but the verifier never uses it.
+
+With Redis, mock and proxy running as above, export the same HMAC secret used by
+the proxy (for the checked-in local example only, `. ./.env; export POKEPROXY_SECRET`
+loads it in a POSIX shell), then run:
+
+```bash
+uv run --frozen python scripts/verify.py
+# Optional: --proxy-url http://127.0.0.1:8000 --mock-url http://127.0.0.1:8001
+```
+
+The verifier signs a fixed Charizard protobuf and checks the complete downstream
+JSON plus expected reason and exactly one correlated receipt. HTTP 200 alone
+cannot pass it. Use `--reason` if the intentionally configured matching reason
+changes. It exits nonzero on HTTP error, missing receipt or mismatched content.
+The load generator is separate: it remains sequential, reports achieved RPS,
+validates rate/duration, exits nonzero on HTTP failures, and reads
+`POKEPROXY_SECRET` before falling back to the public development key. Prefer that
+environment variable to `--secret`, whose argument can appear in process listings.
+
+### Running the expanded tests
+
+```bash
+uv sync --frozen --dev
+uv run --frozen ruff check .
+uv run --frozen pytest -q
+# Also run the real Redis TTL check against an isolated instance:
+TEST_REDIS_URL=redis://127.0.0.1:6379/0 uv run --frozen pytest -q
+```
+
+The full suite includes local socket/process tests and starts temporary Uvicorn
+processes; it needs permission to bind localhost ports and send process signals.
+Only the real Redis test skips when `TEST_REDIS_URL` is unset. It uses a unique
+key and removes it, never FLUSHDB. See the hardening plan for the actual verified
+Redis image and command results.
