@@ -37,9 +37,12 @@ and [earlier planning](../planning/part-1-review.md). They were not redone here.
 - A01 is covered by 007/016; A02 by 013; application-level A06 by 017.
 - A03: replay acceptance and trusted cache writers remain explicit contracts;
   no delivery deduplication or cryptographic cache-integrity layer was introduced.
-- A04: containers, orchestration, packaging the mock image and delivery automation
-  remain later parts. No Kubernetes or CI/CD work is included here.
+- A04: containers, orchestration, mock image packaging and delivery automation
+  were subsequently implemented in [infrastructure](../planning/03-local-deployment.md),
+  [CI/CD](../planning/04-cicd-gitops.md) and [automation](../planning/06-automation.md).
 - A05: this index, README and current hardening plan supersede earlier ELK and
   pre-fix status text. Historical documents are retained with a status notice.
-- Scraping, resource metrics, Grafana, alerting, deployment TLS/network controls
-  and secret provisioning remain later deliverables.
+- Scraping, process resource metrics, Grafana and alert rules were subsequently
+  implemented in [observability](../planning/05-observability.md); local secret
+  provisioning is covered by automation. Deployment TLS, enforced network policy,
+  full cluster resource metrics and external alert delivery remain limitations.

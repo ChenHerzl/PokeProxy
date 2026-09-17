@@ -1,23 +1,79 @@
-# PokeProxy
+# PokeProxy DevOps Assignment
 
-A reverse proxy service that receives Pokemon data streams as protobuf-encoded payloads, validates HMAC signatures, matches against configurable routing rules, and forwards matching Pokemon as JSON to downstream services. It includes a Redis caching layer to avoid re-processing previously seen payloads.
+## Overview
 
-## How It Works
+PokeProxy accepts HMAC-signed Pokémon protobuf messages at `POST /stream`, applies
+routing rules, and forwards matching Pokémon as JSON. This submission hardens the
+application and provides containers, local Kubernetes, CI/CD, deployment verification,
+rollback, monitoring, and a repeatable `make up` entry point.
 
+For a 10–15 minute review, read this README, [rollback behavior](docs/rollback.md),
+and [alert rationale](docs/alerts.md). The [planning index](docs/planning/README.md)
+links implementation decisions and recorded evidence by phase.
+
+## Architecture
+
+```text
+Client / verification Job
+         |
+         | POST /stream: protobuf + HMAC
+         v
+     PokeProxy --------------------> Redis
+         |                    best-effort decoded-data cache
+         | first matching rule
+         | JSON + correlation ID
+         v
+   Mock downstream <-------------- verification Job checks exact receipts
+
+     PokeProxy /metrics <--------- Prometheus <--------- Grafana
+                                     |
+                              five alert rules
+
+GitHub Actions CI -> GHCR images + release artifact
+                  -> promotion PR -> Git desired state
+                                     |
+                              local reconciler
+                                     |
+                              rollout + E2E gate
 ```
-[Client] --POST protobuf+HMAC--> [PokeProxy /stream]
-                                       |
-                                  1. Validate HMAC signature
-                                  2. Check Redis cache
-                                  3. Decode protobuf (on cache miss)
-                                  4. Match against routing rules
-                                  5. Convert to JSON
-                                  6. Forward to downstream
-                                       |
-                                  [Downstream Service]
-```
 
-## One-command local stack
+HMAC validation precedes cache access. A cache hit avoids decoding; it **still
+forwards**. Rule conditions use AND, and the first matching rule wins. A valid
+unmatched message returns HTTP 200 `{}` without a downstream call. A downstream
+attempt has a finite deadline and no automatic POST retry.
+
+## Repository structure
+
+| Path | Purpose |
+| --- | --- |
+| `src/pokeproxy/` | Application, routing, cache, lifecycle, metrics and generated protobuf bindings |
+| `mock_service/`, `config/`, `proto/` | Receipt-recording mock, native development rules and message schema |
+| `tests/` | Application, real-process, delivery, monitoring and automation regression tests |
+| `Dockerfile`, `uv.lock`, `pyproject.toml` | Separate proxy/mock image targets and locked Python dependencies |
+| `infra/kind/` | Pinned local Kubernetes cluster configuration |
+| `deploy/base/`, `deploy/overlays/` | Application manifests, manual local overlay and promoted release desired state |
+| `deploy/monitoring/`, `deploy/verification/` | Prometheus/Grafana, dashboard, alerts and E2E Job |
+| `.github/workflows/` | CI and separate desired-state promotion workflow |
+| `scripts/`, `Makefile` | Bootstrap, reconciliation, verification, load generation and validation |
+| `docs/issues/`, `docs/planning/`, `docs/verification/` | Findings/fixes, implementation records and evidence |
+
+Generated `.local/`, `.kube/` and `.secrets/` directories are ignored by Git.
+
+## Prerequisites
+
+- Linux x86_64 or aarch64; Docker Engine with Buildx running and accessible to your user.
+- At least **2 CPUs / 4 GiB RAM** available to Docker; approximately **10 GiB free disk** recommended.
+- GNU Make, Bash, Python **3.11+**, standard Linux utilities including `timeout` and `flock`.
+- kind **v0.33.0** and kubectl **1.36.x**. If missing, `make tools` explicitly downloads
+  checksum-verified pinned binaries into `.local/bin`; it requires curl, sha256sum and install.
+- Internet access for initial tool/image/dependency downloads.
+
+Install host prerequisites using your normal OS setup. No target installs system
+packages or uses sudo. `make doctor` checks prerequisites without creating a cluster.
+Host uv, Redis, application Python packages and registry credentials are not needed
+for `make up`. Linux x86_64 was tested; ARM64 was not exercised.
+
+## Quick start
 
 From the repository root:
 
@@ -25,142 +81,139 @@ From the repository root:
 make up
 ```
 
-This checks prerequisites, creates or starts kind, builds and loads both app
-images, provisions credentials, deploys Redis/mock/proxy and Prometheus/Grafana,
-waits for readiness, then verifies real protobuf delivery and monitoring. It is
-safe to rerun: unchanged images/configuration do not restart workloads or rotate
-credentials. The first run needs internet access for container images/dependencies.
+If Kubernetes CLIs are missing, run `make tools` first. Bootstrap checks prerequisites,
+creates or starts the `pokeproxy` kind cluster, builds/loads both images, provisions
+local credentials, deploys Redis/mock/proxy and monitoring, waits for readiness,
+and runs E2E and monitoring gates. Any failed step returns non-zero.
 
-Host prerequisites:
+It is safe to rerun: unchanged image content/configuration preserves workload
+Pods, and credentials are retained. Access services in separate terminals:
 
-- Linux x86_64 or aarch64; at least **2 CPUs and 4 GiB RAM** available to Docker;
-  allow roughly **10 GiB free disk** for images, build cache and the cluster.
-- Docker Engine with Buildx, running and accessible by your user.
-- GNU Make, Bash, Python **3.11+**, and standard Linux utilities including
-  `timeout` (coreutils) and `flock` (util-linux).
-- kind **v0.33.0** and kubectl **1.36.x** on PATH, or the checkout-local tools below.
+| Command | Local URL |
+| --- | --- |
+| `make grafana` | http://127.0.0.1:3000/d/pokeproxy-health — anonymous Viewer |
+| `make prometheus` | http://127.0.0.1:9090 — targets, queries and alerts |
+| `make proxy` | http://127.0.0.1:8000/ready |
 
-Install Docker/Make/Python through your normal system setup; `make up` does not
-install system packages or use sudo. See the official
-[Docker Engine Linux installation instructions](https://docs.docker.com/engine/install/).
-If kind/kubectl are missing, this explicit optional command downloads checksum-
-verified pinned binaries into `.local/bin` without changing system directories:
+Tunnels bind localhost and run until Ctrl-C. `make help` lists all helpers.
+After `make proxy`, test `/health`, `/ready`, `/metrics` and `/stats` at
+`http://127.0.0.1:8000`. After `make prometheus`, inspect
+http://127.0.0.1:9090/targets and http://127.0.0.1:9090/alerts.
+These URLs require their tunnel; `make up` prints them but does not start
+background port-forwards. Use `make verify` for signed `/stream` traffic.
 
-```bash
-make tools  # requires curl, sha256sum and install; Linux amd64/arm64
-make up
-```
+Infrastructure images (Redis, Prometheus and Grafana) are also loaded through
+host Docker, preserving the pinned references. This avoids dependence on registry
+DNS inside kind nodes; host Docker still needs network access for uncached images.
 
-Host uv, Python application dependencies, a Redis installation, GitHub credentials
-and a registry login are **not** required for `make up`. Python 3.13 and locked
-application dependencies are installed inside the images. Run `make doctor` to
-check prerequisites without creating a cluster.
-
-After startup, use separate terminals for access:
+## Verification
 
 ```bash
-make grafana     # http://127.0.0.1:3000/d/pokeproxy-health — Viewer, no login
-make prometheus  # http://127.0.0.1:9090 — targets, metrics and alerts
-make proxy       # http://127.0.0.1:8000/ready
+make status       # five Deployments should be available 1/1
+make verify       # real traffic + downstream receipts + monitoring checks
+make logs         # follow proxy logs; Ctrl-C to stop
 ```
 
-Useful helpers: `make status`, `make logs`, `make verify`, `make build`.
-`make test` and `make lint` additionally require uv. `make help` lists all targets.
-Teardown removes only the named `pokeproxy` cluster and its ephemeral data:
+`make verify` prints PASS only after the application gate and monitoring gate
+succeed. An HTTP health check alone does not prove delivery. After `make proxy`,
+`curl -fsS http://127.0.0.1:8000/ready` checks readiness independently.
+
+Optional developer checks require uv and synchronize locked dependencies:
+
+```bash
+make lint
+make test
+```
+
+Recorded local results: **114 passed, 1 skipped** (optional host Redis TTL fixture),
+successful fresh-cluster `make down` → `make up`, successful second `make up` with
+all five workload Pod UIDs unchanged, and a final passing `make verify`.
+[Automation evidence](docs/planning/06-automation.md#validation-and-ai-assisted-flow)
+records commands and environmental assumptions. Earlier CI-equivalent tests ran
+with a real Redis fixture; [delivery evidence](docs/planning/04-cicd-gitops.md#local-validation-and-ai-assisted-flow)
+distinguishes those results from hosted workflows, which were not executed here.
+
+## Teardown
 
 ```bash
 make down
 ```
 
-Local credentials, CLI binaries and Docker caches are preserved. See
-[automation decisions, environmental assumptions and test results](docs/planning/06-automation.md).
+Deletes only the named kind cluster; repeated teardown succeeds. Cluster data,
+including mock receipts and monitoring history, is ephemeral. Local credentials,
+downloaded CLIs and Docker caches remain for reuse. No unrelated Docker resources
+are pruned.
 
-## Native Python development (optional)
+## Application hardening
 
-The following starts the application directly on the host instead of using
-`make up`. Its additional prerequisites are:
+The [issue index](docs/issues/README.md) links each original problem, fix and test:
 
-- Python 3.13+
-- [uv](https://docs.astral.sh/uv/)
-- Redis server running locally
+- Bounded uploads, downstream responses, concurrency and dependency deadlines;
+  pooled HTTP connections without unsafe automatic retries.
+- Direct Redis lookups, validated cache entries and bounded fallback when Redis fails.
+- Startup validation of HMAC configuration and routing rules; corrected protobuf compatibility.
+- Correct HTTP framing, filtered hop-by-hop metadata and isolated cookies/headers.
+- Bounded latency histograms, consistent request accounting and safe structured logs.
+- Graceful shutdown/client cleanup, bounded mock receipts and correlated real-traffic verification.
 
-### Native quick start
+Configuration is documented in [.env.example](.env.example) and the
+[hardening record](docs/planning/02-production-hardening.md). Kubernetes budgets
+are explicit in [pokeproxy.env](deploy/base/pokeproxy.env). Rules load at startup;
+configuration changes require a rollout. `/health` checks the process; `/ready`
+checks initialization and reports the last cache-operation state, not continuous
+Redis connectivity. Cache/downstream outages do not fail liveness.
 
-```bash
-# Install dependencies
-uv sync --frozen --dev
+## Containerization
 
-# Copy and configure environment
-cp .env.example .env
-# Edit .env with your settings
+The [multi-stage Dockerfile](Dockerfile) uses digest-pinned Python 3.13 and uv,
+installs locked runtime dependencies, and produces `proxy` and `mock` targets.
+Runtime images run as UID 10001 with one Uvicorn worker and finite shutdown budgets.
+Dependency layers precede source copying for useful build caching.
 
-# Start Redis (if not already running)
-redis-server &
+`make build` builds both targets. Local bootstrap tags images using their full Docker
+image IDs and loads them into kind. CI uses source-SHA/run/attempt tags and records
+registry manifest digests; release deployments select those digests. These are
+separate local-development and release paths.
 
-# Start the mock downstream service
-uv run --frozen uvicorn mock_service.main:app --host 127.0.0.1 --port 8001 &
+## Kubernetes architecture
 
-# Start PokeProxy
-uv run --frozen uvicorn pokeproxy.main:app --host 127.0.0.1 --port 8000 \
-  --workers 1 --limit-concurrency 200 --timeout-graceful-shutdown 30
-```
+[Application manifests](deploy/base/) contain three single-replica Deployments
+and ClusterIP Services in `pokeproxy`; Prometheus/Grafana run in `monitoring`.
+Kustomize generates configuration hashes to trigger rollouts when settings change.
+Secrets are provisioned outside Git.
 
-## Local Kubernetes deployment (Part 2)
+Workloads define requests/limits, startup/readiness/liveness probes and termination
+budgets. Containers use non-root identities, read-only root filesystems, dropped
+capabilities and restricted privilege escalation. Application Pods do not mount
+API tokens; Prometheus has scoped discovery RBAC. Redis and monitoring storage
+are ephemeral. There is no ingress, TLS termination or NetworkPolicy enforcement
+in this local assignment. See [infrastructure decisions](docs/planning/03-local-deployment.md).
 
-Prerequisites: Docker running, kind, kubectl with Kustomize support, and Python 3.
-Run from this repository root. The cluster image is pinned in
-`infra/kind/cluster.yaml`. See [deployment decisions and verification](docs/planning/03-local-deployment.md).
-The commands below explain the manual Part 2 setup; prefer `make up` for the full
-stack and automatic rebuilding, image selection, credentials and verification.
+## CI pipeline
 
-```bash
-mkdir -p .kube
-kind create cluster --config infra/kind/cluster.yaml --kubeconfig .kube/kind-config
-docker build --target proxy -t pokeproxy:part4 .
-docker build --target mock -t pokeproxy-mock:part2 .
-kind load docker-image --name pokeproxy pokeproxy:part4 pokeproxy-mock:part2
-python3 scripts/create_local_secret.py
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -f deploy/base/namespace.yaml
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -f .secrets/kubernetes-secret.json
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -k deploy/overlays/local
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy rollout status deployment/redis --timeout=180s
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy rollout status deployment/mock-downstream --timeout=180s
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy rollout status deployment/pokeproxy --timeout=180s
-```
+[GitHub Actions CI](.github/workflows/ci.yml) runs on PRs, pushes to main/master,
+and manual dispatch:
 
-Skip cluster creation when the `pokeproxy` cluster already exists. Credentials
-are generated once and preserved on reruns; do not commit `.secrets` or `.kube`.
-Local image tags are for this demonstration. Rebuilding a tag does not restart
-existing Pods; reload images and restart the affected Deployment, or use a new
-image tag in the overlay.
+1. Checkout; configure Python 3.13 and pinned uv with dependency caching.
+2. Ruff lint and pytest, including Redis TTL and real HTTP process tests.
+3. Build wheel/source distribution.
+4. Validate workflow/shell syntax, rendered Kubernetes schemas, Prometheus rules
+   and dashboard JSON; run alert-rule scenarios.
+5. Build both container targets using BuildKit caches.
+6. On default-branch pushes, publish GHCR images with
+   `sha-<full-git-sha>-<run-id>-<attempt>` tags and upload digest-bearing `release.json`.
 
-Run the bounded end-to-end verification (the delete permits repeated runs):
+Actions are pinned by commit. Credentials use scoped `GITHUB_TOKEN` references,
+not literal secrets in YAML. PR/manual builds do not publish images. Hosted
+publication and promotion require configuring this repository on GitHub and
+were not executed in the local validation environment.
 
-```bash
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy delete job pokeproxy-verify --ignore-not-found
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -k deploy/verification
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy wait --for=condition=complete job/pokeproxy-verify --timeout=90s
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy logs job/pokeproxy-verify
-```
+## CD / GitOps flow
 
-A failed wait is a failed verification; inspect Job logs and Pod events. The Job
-checks actual downstream receipts as well as Redis authentication and cache use.
-Services stay inside the cluster. For local access, run
-`kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy port-forward service/pokeproxy 8000:8000`
-and visit `http://127.0.0.1:8000/ready`. Stop the forwarding with Ctrl-C.
-Teardown: `kind delete cluster --name pokeproxy`; this removes ephemeral cache
-and receipt data while keeping your ignored local credentials for reuse.
-
-## CI/CD and GitOps (Part 3)
-
-GitHub Actions [CI](.github/workflows/ci.yml) lints, runs tests with Redis, builds
-Python distributions and both container targets, and validates workflows and
-Kubernetes manifests. Default-branch pushes publish GHCR images tagged with the
-full source SHA plus a unique run/attempt suffix, and record their immutable digests.
-
-The separate [promotion workflow](.github/workflows/promote.yml) takes a successful
-CI run ID and opens a PR updating `deploy/overlays/release`. It does not deploy.
-After merging that PR, fetch Git and reconcile from the machine hosting kind:
+1. Dispatch [promotion](.github/workflows/promote.yml) with a successful default-branch
+   CI run ID. It verifies provenance and opens a PR updating `deploy/overlays/release`.
+2. Review/merge the desired-state PR. The workflow does not access the cluster.
+3. On the cluster host, fetch Git and explicitly reconcile the committed revision:
 
 ```bash
 git fetch origin
@@ -168,266 +221,145 @@ python3 scripts/reconcile.py deploy --context kind-pokeproxy \
   --kubeconfig .kube/kind-config --revision origin/main
 ```
 
-Use `origin/master` if appropriate. The release overlay must first be populated
-by promotion; its bootstrap state intentionally cannot be reconciled. Keep the
-Part 2 application Secret provisioned, and make GHCR packages public for the demo
-or configure a registry pull Secret outside Git. The script uses committed
-manifests, waits for rollouts, sends real protobuf traffic, checks exact downstream
-receipts, and restores the last verified Git snapshot on failure.
+Use the repository's actual default branch. The release overlay starts as an
+intentional placeholder: promote a real release before reconciliation. Application
+Secrets must already exist; GHCR packages must be readable publicly or through an
+externally provisioned pull Secret. GitHub must permit Actions to create PRs;
+PRs created with `GITHUB_TOKEN` need the documented manual check trigger.
+[Complete setup](docs/planning/04-cicd-gitops.md) covers these requirements.
 
-Run just the deployment gate with:
+Argo CD is deliberately not installed. This lightweight reconciler reads desired
+state from Git but does not continuously correct drift. Argo would replace it,
+watch the release overlay and run the verification Job as a PostSync hook. Never
+run both deployment writers. `make up` builds the current working tree and refuses
+to overwrite a cluster with a recorded GitOps release.
+
+## Post-deploy verification
 
 ```bash
 bash scripts/e2e-verify.sh --context kind-pokeproxy --kubeconfig .kube/kind-config
 ```
 
-See [setup, stages, Argo CD integration and verification results](docs/planning/04-cicd-gitops.md)
-and [rollback behavior](docs/rollback.md). Argo CD is not installed; the local
-reconciler handles promoted releases. `make up` is the complete local development
-bootstrap; it does not publish images or modify the Git-tracked release overlay.
+The gate launches a bounded Kubernetes Job using the deployed proxy image and
+Secret. It signs a fixed matching protobuf payload, sends it twice through the
+PokeProxy Service, and checks the mock for exact Pokémon JSON and routing reason
+under unique request IDs. It also checks authenticated Redis, cache reuse,
+readiness and application metrics. It does not clear shared mock history.
+Failure or timeout exits non-zero. `make verify` additionally checks Prometheus
+scraping/traffic metrics, loaded alerts, Grafana's dashboard and datasource.
 
-## Observability (Part 4)
+## Rollback strategy
 
-The proxy exposes bounded Prometheus metrics at `/metrics`. The lightweight
-`deploy/monitoring` stack adds Prometheus, Grafana, a provisioned health dashboard
-and five tested alert rules. See [deployment, metric semantics and verification](docs/planning/05-observability.md)
-and [alert thresholds and operator actions](docs/alerts.md).
+After a release passes rollout and E2E, the reconciler records the verified Git
+revision and image digests in `pokeproxy-release-state`. A failed subsequent
+release reapplies that Git snapshot, waits, and re-verifies it. The attempted
+release still exits non-zero and is blocked from automatic reapplication.
 
-After deploying the monitoring stack, run these in separate terminals:
+An operator must revert/fix desired state in Git for durable recovery. A first
+release has no fallback; failed recovery, interrupted reconciliation, secret
+rotation and downstream side effects require intervention. No data rollback or
+resource pruning occurs. `make up` failures retain resources for diagnosis and
+do **not** invoke release rollback. With Argo, a live rollback alone would be
+reverted by reconciliation; repair Git, and use one controller. See the
+[rollback runbook](docs/rollback.md) for exact steps and limits.
 
-```bash
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n monitoring port-forward --address 127.0.0.1 service/grafana 3000:3000
-kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n monitoring port-forward --address 127.0.0.1 service/prometheus 9090:9090
-```
+## Observability
 
-- Grafana: **http://127.0.0.1:3000/d/pokeproxy-health** — anonymous Viewer, no login.
-- Prometheus: **http://127.0.0.1:9090** — inspect targets, queries and alerts.
+`/metrics` exposes counters for received/completed requests, HMAC/input rejection
+outcomes, rule matches, downstream outcomes and Redis hit/miss/error/write outcomes;
+histograms measure handler and downstream latency. An in-flight gauge measures
+admitted work. Labels use bounded outcomes/statuses/rule indices, never payloads,
+URLs or request IDs. Handler latency excludes response transmission.
 
-Verify scraping and dashboard queries while generating real traffic:
+[Prometheus](deploy/monitoring/prometheus/) discovers proxy Pods and evaluates five
+alerts. [Grafana's 17-panel dashboard](deploy/monitoring/grafana/pokeproxy.json)
+answers “Is PokeProxy healthy right now?” with traffic, failures, latency, cache,
+scrape health and process CPU/RSS. It does not claim whole-cluster resource coverage.
+
+[Alerts](docs/alerts.md) cover unavailable scraping, forwarding failures, server
+errors, slow processing and cache errors, with thresholds, windows and operator
+actions. Ratio alerts require sufficient traffic; individual invalid signatures,
+normal cache misses and unmatched messages are intentionally not paged.
+Alertmanager/notification delivery is not installed.
+
+For a deeper check with 60 seconds of generated traffic and an intentional HMAC
+rejection (requires uv), run:
 
 ```bash
 uv run --frozen python scripts/verify_monitoring.py \
   --context kind-pokeproxy --kubeconfig .kube/kind-config
 ```
 
-The verifier sends 60 seconds of signed traffic plus one intentional HMAC rejection
-and checks metric changes, alert loading and Grafana's datasource. Dashboard and
-alert definitions live in Git; monitoring storage is ephemeral for this local demo.
+See [metric semantics and load evidence](docs/planning/05-observability.md) and the
+[recorded monitoring result](docs/verification/part-4.json).
 
-## Configuration
+## Security considerations
 
-### Environment Variables
+Local HMAC/Redis/Grafana credentials are generated once, stored in ignored private
+files, and preserved or recovered on reruns; mismatches fail rather than silently
+rotate credentials. Kubernetes Secrets are not encrypted merely because their
+values are base64 encoded. The public `.env.example` key is for native development
+only; bootstrap generates its own credentials.
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `POKEPROXY_SECRET` | Yes | - | Base64-encoded HMAC secret, at least 32 decoded bytes |
-| `POKEPROXY_CONFIG` | Yes | - | Path to rules JSON file |
-| `REDIS_URL` | No | `redis://localhost:6379/0` | Redis connection URL |
+HMAC authenticates payloads but does not prevent replay. Redis writers and routing
+configuration remain trusted. Logs omit payloads, signatures, credentials and raw
+destination URLs. Keep metrics, mock administration and Grafana private: anonymous
+Viewer access and plaintext internal traffic are local conveniences, not public
+service security. Port-forward access requires authorized Kubernetes credentials.
 
-### Rules Config
+## Design decisions and trade-offs
 
-Rules are loaded from the JSON file specified by `POKEPROXY_CONFIG`.
+| Decision | Reason / cost |
+| --- | --- |
+| kind + Kustomize + Make | Small reproducible local stack; no cloud account, Terraform state or Helm dependency |
+| Best-effort Redis cache | Forwarding survives cache failure; cache is not delivery deduplication |
+| No automatic POST retries | Avoids hidden duplicate delivery; caller retries can still duplicate side effects |
+| Manual Git reconciler | Demonstrates promotion, gating and recovery without Argo's local overhead; no continuous drift correction |
+| Lightweight monitoring | Useful application signals without an operator/exporter stack; limited infrastructure visibility |
+| Single worker and replicas | Predictable process-local counters/receipts; no HA or multi-worker aggregation claim |
 
-```json
-{
-  "rules": [
-    {
-      "url": "http://localhost:8001/pokemon",
-      "reason": "strong fire pokemon",
-      "match": ["type_one==Fire", "attack>80", "generation<4"]
-    }
-  ]
-}
-```
+## Production vs local assignment environment
 
-**Match operators:** `==`, `!=`, `>`, `<`
+Production would need a managed or resilient multi-node cluster, measured capacity,
+multiple proxy replicas, disruption/topology policy and enforced network boundaries.
+Replace local credentials with managed secret delivery/rotation, add TLS and proper
+operator authentication, and use a controlled release reconciler such as Argo CD.
 
-**Match logic:** All conditions in a rule must match (AND). First matching rule wins.
+Retain immutable release artifacts and deployment audit history; add image scanning,
+provenance/signing and policy enforcement. Define SLOs from real traffic, tune alerts,
+route notifications, add cluster resource monitoring and durable monitoring storage.
+Redis availability/persistence should reflect its cache-only contract. Replace the
+mock with actual downstream integration tests and a documented delivery/idempotency
+contract before claiming reliable business delivery.
 
-**Fields:** `number`, `name`, `type_one`, `type_two`, `total`, `hit_points`, `attack`, `defense`, `special_attack`, `special_defense`, `speed`, `generation`, `legendary`
+## Known limitations
 
-## Endpoints
+- One-node local cluster, ephemeral state; no HA, disaster-recovery or production capacity validation.
+- No replay protection/exactly-once delivery; timeout can follow downstream acceptance.
+- Single-process mock receipts are bounded and can be evicted; one fixed E2E route
+  does not prove every rule or sustained throughput.
+- Local reconciler has a host-local lock, no pruning and no continuous controller;
+  monitoring does not automatically trigger rollback.
+- Metrics reflect application-handler work, excluding server-level rejection before
+  the handler; process RSS is not Pod memory/CPU throttling coverage.
+- Hosted Actions/GHCR/promotion were not run here. Live rollback testing restored
+  configuration using the same images; additional failure branches have unit coverage.
+- Bootstrap reused Docker caches and local credentials after deleting the cluster;
+  a pristine OS, ARM64 and stopped-node recovery were not separately tested.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/stream` | POST | Proxy endpoint — validates, matches, forwards |
-| `/health` | GET | Health check |
-| `/ready` | GET | Initialized readiness and last cache operation health |
-| `/stats` | GET | Per-rule cumulative forwarding summary |
-| `/metrics` | GET | Prometheus application metrics |
+## Future improvements
 
-## Load Generator
+Prioritize downstream idempotency/replay policy, continuous Git reconciliation with
+a reviewed Git-revert mechanism, supply-chain checks, and realistic load/SLO tests.
+Add production networking, secrets and alert delivery when a target environment
+exists; expand route coverage and multi-replica tests before scaling the service.
 
-A load generator script is included to send synthetic Pokemon traffic:
+## Planning / implementation process
 
-```bash
-uv run --frozen python scripts/load_generator.py --rps 10 --duration 60
-```
-
-Options:
-- `--url` — Target URL (default: `http://localhost:8000/stream`)
-- `--rps` — Requests per second (default: 10)
-- `--duration` — Duration in seconds, 0 for infinite (default: 60)
-- `--secret` — Base64-encoded HMAC secret (default: test secret)
-
-## Testing
-
-```bash
-uv run --frozen pytest -v
-```
-
-## Startup configuration and dependency verification
-
-Run commands from the repository root. `POKEPROXY_SECRET` is the supported
-secret variable; `POKEPROXY_HMAC_KEY` is not supported. The value must be strict
-base64 encoding of at least 32 bytes. The public key in `.env.example` and the
-load generator is only for local demonstrations. Generate a random key with:
-
-```bash
-python3 -c 'import base64, secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())'
-```
-
-Store it in `.env` (ignored by Git) and use the same key for clients. The length
-check does not measure entropy. Settings representations and human-readable
-validation errors hide secret values; do not log raw environment variables or
-Pydantic `ValidationError.errors()` / `.json()`, which can include input values.
-Set the listener port with Uvicorn's `--port`; `POKEPROXY_PORT` has been removed
-because it never controlled the server.
-
-Install using `uv sync --frozen --dev` and run `uv run --frozen pytest -v`.
-The protobuf runtime minimum is 6.31.1 to match the generated code; the lock file
-selects the exact normal development/runtime dependencies. Regenerate protobuf
-files with `sh scripts/generate_proto.sh` (requires uv and package-index access).
-The isolated generator is pinned to `grpcio-tools==1.74.0`; review generated diffs
-and rerun tests after changing the schema.
-
-See [step 1 verification](docs/verification/step-1.md) for results and scope,
-[review findings](docs/issues/README.md) for remaining work, and
-[planning decisions](docs/planning/part-1-review.md).
-
-
-## Production hardening (Part 1)
-
-See [implemented decisions and results](docs/planning/02-production-hardening.md)
-and [individual issue records](docs/issues/README.md). Kubernetes, CI/CD and the
-Prometheus/Grafana deployment are covered in Parts 2–4 above.
-
-The proxy validates configuration before serving requests. Rules are read once;
-restart after changing the file. Top-level JSON must contain only `rules`, and
-rules require `url`, `reason`, and `match`. An explicitly empty list is allowed;
-a missing list is an error. Reasons must be printable ASCII, at most 1024
-characters. URLs need an HTTP(S) host and cannot contain credentials or fragments.
-AND conditions, first match, numeric JSON fields, and unmatched HTTP 200 `{}` are
-unchanged. Cache hits still forward: Redis avoids decoding, not delivery.
-
-Forwarding uses one pooled HTTP request, with no automatic POST retry. Timeouts
-return 504, transport/oversized-response failures return 502. Ambiguous failures
-can occur after downstream acceptance; caller retries can still duplicate work.
-Responses preserve raw downstream bytes and Content-Encoding while recalculating
-Content-Length; the response limit applies to encoded bytes, not decompressed
-client memory. Hop-by-hop metadata and proxy-owned request headers are filtered.
-The HTTP pool does not retain cookies between callers and ignores environment
-proxy settings (`trust_env=False`). Configure routing URLs explicitly.
-
-Redis is a best-effort decoded-data cache. Read/write errors and corrupt entries
-fall back to decoding/forwarding within a per-operation budget. Redis URL query
-options are forbidden so they cannot override timeouts/pool settings. Redis must
-be trusted and network-restricted: schema validation does not authenticate cached
-content against the original signed payload.
-
-### Operational settings
-
-All application limits are positive and loaded from the environment or `.env`.
-Non-finite time values are rejected. Environment values take precedence.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `POKEPROXY_HTTP_TIMEOUT` | 5 | Each HTTP connect/read/write/pool inactivity timeout, seconds |
-| `POKEPROXY_DOWNSTREAM_DEADLINE` | 10 | Total downstream attempt budget, seconds |
-| `POKEPROXY_UPLOAD_TIMEOUT` | 10 | Total request body read budget, seconds |
-| `POKEPROXY_REDIS_TIMEOUT` | 0.25 | Total budget for each Redis read or write, seconds |
-| `POKEPROXY_CACHE_TTL` | 300 | Cached decoded JSON TTL, seconds |
-| `POKEPROXY_MAX_BODY_BYTES` | 1048576 | Maximum accumulated inbound protobuf bytes |
-| `POKEPROXY_MAX_RESPONSE_BYTES` | 1048576 | Maximum raw downstream response bytes |
-| `POKEPROXY_MAX_INFLIGHT` | 100 | Concurrent admitted `/stream` handlers and client pool capacities |
-| `POKEPROXY_CLOSE_TIMEOUT` | 2 | Budget for closing each shared client, seconds |
-
-Admission rejects excess work immediately with 503. The application cap ends when
-its handler returns; Uvicorn's separate concurrency limit also bounds outstanding
-ASGI responses/slow clients. Run one worker per process; metrics, admission, and
-mock receipts are process-local. Choose limits from measured capacity rather than
-assuming these defaults are a production sizing result.
-
-### Health, termination and diagnostics
-
-`/health` reports the live process. `/ready` requires completed initialization;
-cache health is `unknown`, `healthy`, or `degraded` based on the last operation,
-not a continuous connectivity probe. Cache/downstream outages do not fail liveness
-or automatically remove a functioning proxy from service.
-
-Uvicorn handles SIGTERM/SIGINT: it stops accepting connections, drains in-flight
-work, then exits the lifespan and closes clients. Do not install a competing
-application signal handler. Use a finite graceful-shutdown timeout; the example
-30 seconds covers the default 10-second upload, two 0.25-second cache operations,
-and 10-second downstream budget. Each client close adds up to 2 seconds; allow
-additional process termination grace outside Uvicorn. Raising budgets requires
-revisiting this timing. Shutdown tests cover both signals during a hung downstream.
-
-Application logs are JSON on stdout with event, safe request ID, outcome and
-context. HTTP responses include `X-Request-ID`; generated error JSON also includes
-`request_id`. IDs are correlation data, not authenticated identities. Arbitrary
-client IDs are accepted only within the documented safe character/length bounds.
-Raw payloads, signatures, keys, exception text and destination URLs are omitted.
-Uvicorn's own server/access logs retain its standard format. `/metrics`, `/stats`
-and mock administration endpoints should be private in the later deployment.
-
-`/metrics` exports request/forwarding counters, duration histograms in seconds,
-cache outcome counters and current admitted work. Labels are bounded outcomes,
-statuses and `rule_0`, `rule_1`, etc. Rule indices refer to the startup ordering;
-reordering rules changes their meaning across releases. `/stats` now uses these
-IDs instead of URLs. `bytes_sent` counts attempted JSON payload bytes, not proven
-socket delivery. Infrastructure CPU/memory collection, scraping, dashboards and
-alerts are not implemented in Part 1.
-
-### Mock and end-to-end verification
-
-The mock requires one worker. It retains at most `MOCK_MAX_RECEIPTS` (default
-1000); `MOCK_MAX_BODY_BYTES` defaults to 1048576 and `MOCK_UPLOAD_TIMEOUT` to 10
-seconds. These are environment settings, loaded at startup. Receipt state is lost
-on restart, and old receipts are evicted; size the retention for demonstration
-traffic. GET `/received?request_id=...` isolates a run. DELETE remains available
-for manual reset, but the verifier never uses it.
-
-With Redis, mock and proxy running as above, export the same HMAC secret used by
-the proxy (for the checked-in local example only, `. ./.env; export POKEPROXY_SECRET`
-loads it in a POSIX shell), then run:
-
-```bash
-uv run --frozen python scripts/verify.py
-# Optional: --proxy-url http://127.0.0.1:8000 --mock-url http://127.0.0.1:8001
-```
-
-The verifier signs a fixed Charizard protobuf and checks the complete downstream
-JSON plus expected reason and exactly one correlated receipt. HTTP 200 alone
-cannot pass it. Use `--reason` if the intentionally configured matching reason
-changes. It exits nonzero on HTTP error, missing receipt or mismatched content.
-The load generator is separate: it remains sequential, reports achieved RPS,
-validates rate/duration, exits nonzero on HTTP failures, and reads
-`POKEPROXY_SECRET` before falling back to the public development key. Prefer that
-environment variable to `--secret`, whose argument can appear in process listings.
-
-### Running the expanded tests
-
-```bash
-uv sync --frozen --dev
-uv run --frozen ruff check .
-uv run --frozen pytest -q
-# Also run the real Redis TTL check against an isolated instance:
-TEST_REDIS_URL=redis://127.0.0.1:6379/0 uv run --frozen pytest -q
-```
-
-The full suite includes local socket/process tests and starts temporary Uvicorn
-processes; it needs permission to bind localhost ports and send process signals.
-Only the real Redis test skips when `TEST_REDIS_URL` is unset. It uses a unique
-key and removes it, never FLUSHDB. See the hardening plan for the actual verified
-Redis image and command results.
+Development was AI-assisted: repository inspection, proposed changes, implementation,
+tests and documentation were performed through an interactive coding assistant.
+The [planning index](docs/planning/README.md) lists phases 01–06, prompt categories,
+recorded decisions and validation limits. Historical assessments describe their
+original point in time; they are not the current completion checklist. This final
+pass reviewed source, manifests, workflows and existing evidence and reorganized
+documentation without adding application features.

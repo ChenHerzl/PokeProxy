@@ -229,4 +229,5 @@ running. The ignored local Grafana credential file remains for reuse.
 
 Only the compact monitoring stack and application signals are added. Persistent
 storage, whole-cluster resource exporters, notification routing, automated
-monitoring-driven rollback, and one-command bootstrap remain separate work.
+monitoring-driven rollback remain outside this phase. One-command bootstrap was
+subsequently implemented in [Part 5 automation](06-automation.md).

@@ -104,7 +104,12 @@ build_images() {
 
 rollout() {
   echo "Waiting for $1/deployment/$2"
-  timeout 320 "${KUBE[@]}" -n "$1" rollout status "deployment/$2" --timeout=300s --request-timeout=310s
+  if ! timeout 320 "${KUBE[@]}" -n "$1" rollout status "deployment/$2" --timeout=300s --request-timeout=310s; then
+    echo 'Rollout failed. Pod status and recent events:' >&2
+    timeout 30 "${KUBE[@]}" -n "$1" get pods || echo 'Could not fetch Pods.' >&2
+    timeout 30 "${KUBE[@]}" -n "$1" get events --sort-by=.lastTimestamp || echo 'Could not fetch events.' >&2
+    fail "Deployment $1/$2 did not become ready; resolve the reported error and rerun make up."
+  fi
 }
 
 verify_stack() {
@@ -121,6 +126,17 @@ PokeProxy and monitoring are ready. Run each tunnel in a separate terminal:
   make grafana     -> http://127.0.0.1:3000/d/pokeproxy-health (Viewer, no login)
   make prometheus  -> http://127.0.0.1:9090 (targets and alerts)
   make proxy       -> http://127.0.0.1:8000/ready
+
+After starting those tunnels, test:
+  http://127.0.0.1:8000/health       process health
+  http://127.0.0.1:8000/ready        application readiness
+  http://127.0.0.1:8000/metrics      Prometheus application metrics
+  http://127.0.0.1:8000/stats        per-rule forwarding statistics
+  http://127.0.0.1:9090/targets      scrape target health
+  http://127.0.0.1:9090/alerts       alert state
+  curl -fsS http://127.0.0.1:8000/ready
+Use make verify to test signed POST /stream traffic and downstream delivery.
+The URLs become reachable after their tunnel starts; no tunnels run in the background.
 
 Useful commands: make status, make logs, make verify
 Teardown: make down (deletes only kind cluster pokeproxy; keeps local credentials and image caches)
@@ -182,6 +198,8 @@ case "$ACTION" in
     build_images
     step 'Load both content-tagged images into kind'
     timeout 300 "$KIND_BIN" load docker-image --name "$CLUSTER" "$PROXY_IMAGE" "$MOCK_IMAGE"
+    step 'Preload pinned Redis, Prometheus and Grafana images through host Docker'
+    KIND_BIN="$KIND_BIN" python3 scripts/load-dependency-images.py
     step 'Prepare namespaces and preserve credentials'
     timeout 60 "${KUBE[@]}" apply -f deploy/base/namespace.yaml -f deploy/monitoring/namespace.yaml
     python3 scripts/local_config.py secrets --kubeconfig "$KUBE_FILE"

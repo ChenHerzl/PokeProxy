@@ -232,3 +232,28 @@ the described host; a newly provisioned OS, ARM64 and stopped-node recovery were
 not separately exercised. Unit tests cover first-time credential generation,
 credential recovery/preservation/mismatch rejection, mutable-image rejection,
 missing prerequisite failure and monitoring failure detection.
+
+## Follow-up: kind registry DNS failure
+
+A later user run reached Redis rollout but failed with `ImagePullBackOff`:
+containerd could not resolve `registry-1.docker.io` through the kind network DNS
+server. The proxy and mock were healthy because their images were already loaded.
+Bootstrap now also preloads the three digest-pinned infrastructure images using
+host Docker and kind. It reuses exact pinned host references or pulls them with a
+bounded timeout, then restores the canonical digest references in node containerd
+because Docker image archives omit RepoDigests. The deployed manifests keep their
+pinned references. Host Docker must still reach registries for uncached images;
+this does not repair arbitrary external DNS access from application Pods.
+
+Rollout failures now print Pod status and namespace events. Successful startup
+prints explicit HTTP health/readiness/metrics/stats, Prometheus targets/alerts and
+Grafana dashboard URLs, with their foreground port-forward commands. No background
+tunnel process is started. Regression tests cover pinned-image loading and fatal
+host image-pull failure.
+
+Validation of this fix: reran `make up` against the user's failed cluster without
+teardown. Redis recovered, both monitoring Deployments became ready, the two
+correlated downstream receipts passed, and monitoring confirmed one healthy
+scrape target, five alert rules and 17 dashboard panels. The command exited 0
+and printed the expanded URL list. Full pytest: **116 passed, 1 skipped**;
+Ruff, shell syntax, actionlint and `git diff --check` passed.

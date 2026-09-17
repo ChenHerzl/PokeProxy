@@ -125,3 +125,42 @@ def test_monitoring_gate_rejects_missing_application_metrics():
 
     with pytest.raises(ValueError, match="E2E requests"):
         check(SimpleNamespace(call=call))
+
+
+@pytest.mark.parametrize("pull_fails", [False, True])
+def test_dependency_preload_preserves_digest_and_propagates_pull_failure(
+    monkeypatch, pull_fails
+):
+    import runpy
+
+    module = runpy.run_path("scripts/load-dependency-images.py", run_name="test_loader")
+    main = module["main"]
+    image = "redis:7.4.8-alpine@sha256:" + "a" * 64
+    calls = []
+    inspections = 0
+
+    def fake_call(*args, **kwargs):
+        nonlocal inspections
+        calls.append(args)
+        if args[1:3] == ("get", "nodes"):
+            return "pokeproxy-control-plane"
+        if args[:3] == ("docker", "image", "inspect"):
+            inspections += 1
+            if inspections == 1:
+                raise subprocess.CalledProcessError(1, args)
+            return "sha256:" + "b" * 64
+        if args[:2] == ("docker", "pull") and pull_fails:
+            raise subprocess.CalledProcessError(1, args, stderr="registry unavailable")
+        return ""
+
+    monkeypatch.setitem(main.__globals__, "call", fake_call)
+    monkeypatch.setitem(main.__globals__, "images", lambda: iter([image]))
+    if pull_fails:
+        with pytest.raises(subprocess.CalledProcessError):
+            main()
+        assert not any(c[:2] == ("docker", "exec") for c in calls)
+    else:
+        main()
+        assert ("docker", "pull", image) in calls
+        assert calls[-1][-1] == "docker.io/library/redis@sha256:" + "a" * 64
+        assert "--force" in calls[-1]
