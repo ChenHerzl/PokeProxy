@@ -45,3 +45,6 @@ Thumbs.db
 
 # Local Kubernetes client credentials
 .kube/
+
+# Local bootstrap tools, image references, locks and diagnostics
+.local/

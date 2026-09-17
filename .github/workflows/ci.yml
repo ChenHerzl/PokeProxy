@@ -51,6 +51,8 @@ jobs:
       - name: Validate workflows and Kubernetes schemas
         run: |
           actionlint
+          bash -n scripts/local.sh scripts/install-local-tools.sh
+          make help
           bash scripts/validate-kubernetes.sh
           bash scripts/validate-monitoring.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

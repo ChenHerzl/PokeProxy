@@ -17,13 +17,74 @@ A reverse proxy service that receives Pokemon data streams as protobuf-encoded p
                                   [Downstream Service]
 ```
 
-## Prerequisites
+## One-command local stack
+
+From the repository root:
+
+```bash
+make up
+```
+
+This checks prerequisites, creates or starts kind, builds and loads both app
+images, provisions credentials, deploys Redis/mock/proxy and Prometheus/Grafana,
+waits for readiness, then verifies real protobuf delivery and monitoring. It is
+safe to rerun: unchanged images/configuration do not restart workloads or rotate
+credentials. The first run needs internet access for container images/dependencies.
+
+Host prerequisites:
+
+- Linux x86_64 or aarch64; at least **2 CPUs and 4 GiB RAM** available to Docker;
+  allow roughly **10 GiB free disk** for images, build cache and the cluster.
+- Docker Engine with Buildx, running and accessible by your user.
+- GNU Make, Bash, Python **3.11+**, and standard Linux utilities including
+  `timeout` (coreutils) and `flock` (util-linux).
+- kind **v0.33.0** and kubectl **1.36.x** on PATH, or the checkout-local tools below.
+
+Install Docker/Make/Python through your normal system setup; `make up` does not
+install system packages or use sudo. See the official
+[Docker Engine Linux installation instructions](https://docs.docker.com/engine/install/).
+If kind/kubectl are missing, this explicit optional command downloads checksum-
+verified pinned binaries into `.local/bin` without changing system directories:
+
+```bash
+make tools  # requires curl, sha256sum and install; Linux amd64/arm64
+make up
+```
+
+Host uv, Python application dependencies, a Redis installation, GitHub credentials
+and a registry login are **not** required for `make up`. Python 3.13 and locked
+application dependencies are installed inside the images. Run `make doctor` to
+check prerequisites without creating a cluster.
+
+After startup, use separate terminals for access:
+
+```bash
+make grafana     # http://127.0.0.1:3000/d/pokeproxy-health — Viewer, no login
+make prometheus  # http://127.0.0.1:9090 — targets, metrics and alerts
+make proxy       # http://127.0.0.1:8000/ready
+```
+
+Useful helpers: `make status`, `make logs`, `make verify`, `make build`.
+`make test` and `make lint` additionally require uv. `make help` lists all targets.
+Teardown removes only the named `pokeproxy` cluster and its ephemeral data:
+
+```bash
+make down
+```
+
+Local credentials, CLI binaries and Docker caches are preserved. See
+[automation decisions, environmental assumptions and test results](docs/planning/06-automation.md).
+
+## Native Python development (optional)
+
+The following starts the application directly on the host instead of using
+`make up`. Its additional prerequisites are:
 
 - Python 3.13+
 - [uv](https://docs.astral.sh/uv/)
 - Redis server running locally
 
-## Quick Start
+### Native quick start
 
 ```bash
 # Install dependencies
@@ -49,6 +110,8 @@ uv run --frozen uvicorn pokeproxy.main:app --host 127.0.0.1 --port 8000 \
 Prerequisites: Docker running, kind, kubectl with Kustomize support, and Python 3.
 Run from this repository root. The cluster image is pinned in
 `infra/kind/cluster.yaml`. See [deployment decisions and verification](docs/planning/03-local-deployment.md).
+The commands below explain the manual Part 2 setup; prefer `make up` for the full
+stack and automatic rebuilding, image selection, credentials and verification.
 
 ```bash
 mkdir -p .kube
@@ -120,7 +183,8 @@ bash scripts/e2e-verify.sh --context kind-pokeproxy --kubeconfig .kube/kind-conf
 
 See [setup, stages, Argo CD integration and verification results](docs/planning/04-cicd-gitops.md)
 and [rollback behavior](docs/rollback.md). Argo CD is not installed; the local
-reconciler is the assignment's runnable deployment path. Part 5 remains separate.
+reconciler handles promoted releases. `make up` is the complete local development
+bootstrap; it does not publish images or modify the Git-tracked release overlay.
 
 ## Observability (Part 4)
 
