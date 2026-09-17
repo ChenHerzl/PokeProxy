@@ -3,6 +3,3 @@ kind: Kustomization
 namespace: pokeproxy
 resources:
   - job.yaml
-images:
-  - name: pokeproxy
-    newTag: part4

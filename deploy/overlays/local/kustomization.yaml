@@ -4,6 +4,6 @@ resources:
   - ../../base
 images:
   - name: pokeproxy
-    newTag: part2
+    newTag: part4
   - name: pokeproxy-mock
     newTag: part2

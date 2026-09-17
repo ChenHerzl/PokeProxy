@@ -2,7 +2,13 @@
 
 from dataclasses import dataclass
 
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+from prometheus_client import (
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    ProcessCollector,
+)
 
 
 @dataclass
@@ -31,33 +37,62 @@ class EndpointStats:
 class StatsRegistry:
     def __init__(self):
         self.registry = CollectorRegistry()
+        ProcessCollector(registry=self.registry)
         self.endpoints: dict[str, EndpointStats] = {}
+        self.received = Counter(
+            "pokeproxy_requests_received_total",
+            "POST /stream handler entries, before admission or input validation",
+            registry=self.registry,
+        )
         self.requests = Counter(
             "pokeproxy_requests_total",
-            "Completed stream requests",
+            "Finished POST /stream handlers, including rejections and cancellations",
             ["outcome", "status"],
             registry=self.registry,
         )
         self.duration = Histogram(
             "pokeproxy_request_duration_seconds",
-            "Stream duration",
+            "POST /stream handler time including upload, cache, routing and forwarding; excludes response transmission",
+            buckets=(
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+                2.5,
+                5,
+                10,
+                15,
+                20,
+                30,
+            ),
+            registry=self.registry,
+        )
+        self.rule_matches = Counter(
+            "pokeproxy_rule_matches_total",
+            "First-match routing decisions, before downstream forwarding",
+            ["rule"],
             registry=self.registry,
         )
         self.forward = Counter(
             "pokeproxy_forward_total",
-            "Single downstream attempts",
+            "Finished single downstream attempts; success is an HTTP status below 400",
             ["rule", "outcome"],
             registry=self.registry,
         )
         self.forward_duration = Histogram(
             "pokeproxy_forward_duration_seconds",
-            "Downstream duration",
+            "Downstream attempt time through bounded raw response-body read, including failed attempts",
             ["rule"],
+            buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15),
             registry=self.registry,
         )
         self.cache = Counter(
             "pokeproxy_cache_total",
-            "Cache operations",
+            "Cache operation results: hit/miss/read_error for reads; write/write_error for writes",
             ["outcome"],
             registry=self.registry,
         )

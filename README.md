@@ -53,9 +53,9 @@ Run from this repository root. The cluster image is pinned in
 ```bash
 mkdir -p .kube
 kind create cluster --config infra/kind/cluster.yaml --kubeconfig .kube/kind-config
-docker build --target proxy -t pokeproxy:part2 .
+docker build --target proxy -t pokeproxy:part4 .
 docker build --target mock -t pokeproxy-mock:part2 .
-kind load docker-image --name pokeproxy pokeproxy:part2 pokeproxy-mock:part2
+kind load docker-image --name pokeproxy pokeproxy:part4 pokeproxy-mock:part2
 python3 scripts/create_local_secret.py
 kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -f deploy/base/namespace.yaml
 kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -f .secrets/kubernetes-secret.json
@@ -120,7 +120,35 @@ bash scripts/e2e-verify.sh --context kind-pokeproxy --kubeconfig .kube/kind-conf
 
 See [setup, stages, Argo CD integration and verification results](docs/planning/04-cicd-gitops.md)
 and [rollback behavior](docs/rollback.md). Argo CD is not installed; the local
-reconciler is the assignment's runnable deployment path. Parts 4–5 remain separate.
+reconciler is the assignment's runnable deployment path. Part 5 remains separate.
+
+## Observability (Part 4)
+
+The proxy exposes bounded Prometheus metrics at `/metrics`. The lightweight
+`deploy/monitoring` stack adds Prometheus, Grafana, a provisioned health dashboard
+and five tested alert rules. See [deployment, metric semantics and verification](docs/planning/05-observability.md)
+and [alert thresholds and operator actions](docs/alerts.md).
+
+After deploying the monitoring stack, run these in separate terminals:
+
+```bash
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n monitoring port-forward --address 127.0.0.1 service/grafana 3000:3000
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n monitoring port-forward --address 127.0.0.1 service/prometheus 9090:9090
+```
+
+- Grafana: **http://127.0.0.1:3000/d/pokeproxy-health** — anonymous Viewer, no login.
+- Prometheus: **http://127.0.0.1:9090** — inspect targets, queries and alerts.
+
+Verify scraping and dashboard queries while generating real traffic:
+
+```bash
+uv run --frozen python scripts/verify_monitoring.py \
+  --context kind-pokeproxy --kubeconfig .kube/kind-config
+```
+
+The verifier sends 60 seconds of signed traffic plus one intentional HMAC rejection
+and checks metric changes, alert loading and Grafana's datasource. Dashboard and
+alert definitions live in Git; monitoring storage is ephemeral for this local demo.
 
 ## Configuration
 
@@ -218,7 +246,7 @@ See [step 1 verification](docs/verification/step-1.md) for results and scope,
 
 See [implemented decisions and results](docs/planning/02-production-hardening.md)
 and [individual issue records](docs/issues/README.md). Kubernetes, CI/CD and the
-Prometheus/Grafana deployment are subsequent work.
+Prometheus/Grafana deployment are covered in Parts 2–4 above.
 
 The proxy validates configuration before serving requests. Rules are read once;
 restart after changing the file. Top-level JSON must contain only `rules`, and

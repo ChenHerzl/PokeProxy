@@ -1,0 +1,380 @@
+{
+  "rule_files": [
+    "alerts.yml"
+  ],
+  "evaluation_interval": "1m",
+  "tests": [
+    {
+      "name": "all targets absent is an outage",
+      "interval": "1m",
+      "input_series": [],
+      "alert_rule_test": [
+        {
+          "eval_time": "0m",
+          "alertname": "PokeProxyScrapeUnavailable",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "2m",
+          "alertname": "PokeProxyScrapeUnavailable",
+          "exp_alerts": [
+            {
+              "exp_labels": {
+                "severity": "critical",
+                "service": "pokeproxy"
+              },
+              "exp_annotations": {
+                "summary": "No PokeProxy Pod can be scraped",
+                "runbook": "docs/alerts.md#pokeproxyscrapeunavailable"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "known target unreachable",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "up{job=\"pokeproxy\",pod=\"proxy-one\"}",
+          "values": "0+0x10"
+        }
+      ],
+      "alert_rule_test": [
+        {
+          "eval_time": "2m",
+          "alertname": "PokeProxyScrapeUnavailable",
+          "exp_alerts": [
+            {
+              "exp_labels": {
+                "severity": "critical",
+                "service": "pokeproxy"
+              },
+              "exp_annotations": {
+                "summary": "No PokeProxy Pod can be scraped",
+                "runbook": "docs/alerts.md#pokeproxyscrapeunavailable"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "forward failures fire after hold and resolve after recovery",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "up{job=\"pokeproxy\",pod=\"proxy-one\"}",
+          "values": "1+0x20"
+        },
+        {
+          "series": "pokeproxy_forward_total{job=\"pokeproxy\",rule=\"rule_0\",outcome=\"success\"}",
+          "values": "0+90x20"
+        },
+        {
+          "series": "pokeproxy_forward_total{job=\"pokeproxy\",rule=\"rule_0\",outcome=\"http_error\"}",
+          "values": "0+10x4 40+0x16"
+        }
+      ],
+      "alert_rule_test": [
+        {
+          "eval_time": "2m",
+          "alertname": "PokeProxyForwardingFailures",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "3m",
+          "alertname": "PokeProxyForwardingFailures",
+          "exp_alerts": [
+            {
+              "exp_labels": {
+                "severity": "critical",
+                "service": "pokeproxy"
+              },
+              "exp_annotations": {
+                "summary": "More than 5% of downstream attempts fail",
+                "runbook": "docs/alerts.md#pokeproxyforwardingfailures"
+              }
+            }
+          ]
+        },
+        {
+          "eval_time": "12m",
+          "alertname": "PokeProxyForwardingFailures",
+          "exp_alerts": []
+        }
+      ]
+    },
+    {
+      "name": "server errors fire after hold",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "up{job=\"pokeproxy\",pod=\"proxy-one\"}",
+          "values": "1+0x20"
+        },
+        {
+          "series": "pokeproxy_requests_total{job=\"pokeproxy\",outcome=\"forwarded\",status=\"200\"}",
+          "values": "0+90x10"
+        },
+        {
+          "series": "pokeproxy_requests_total{job=\"pokeproxy\",outcome=\"internal_error\",status=\"500\"}",
+          "values": "0+10x10"
+        }
+      ],
+      "alert_rule_test": [
+        {
+          "eval_time": "2m",
+          "alertname": "PokeProxyServerErrors",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "3m",
+          "alertname": "PokeProxyServerErrors",
+          "exp_alerts": [
+            {
+              "exp_labels": {
+                "severity": "critical",
+                "service": "pokeproxy"
+              },
+              "exp_annotations": {
+                "summary": "More than 5% of stream handlers finish with server errors",
+                "runbook": "docs/alerts.md#pokeproxyservererrors"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "slow processing fraction",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "up{job=\"pokeproxy\",pod=\"proxy-one\"}",
+          "values": "1+0x20"
+        },
+        {
+          "series": "pokeproxy_request_duration_seconds_count{job=\"pokeproxy\"}",
+          "values": "0+100x15"
+        },
+        {
+          "series": "pokeproxy_request_duration_seconds_bucket{job=\"pokeproxy\",le=\"1.0\"}",
+          "values": "0+80x15"
+        }
+      ],
+      "alert_rule_test": [
+        {
+          "eval_time": "5m",
+          "alertname": "PokeProxySlowProcessing",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "6m",
+          "alertname": "PokeProxySlowProcessing",
+          "exp_alerts": [
+            {
+              "exp_labels": {
+                "severity": "warning",
+                "service": "pokeproxy"
+              },
+              "exp_annotations": {
+                "summary": "More than 10% of stream handlers take over one second",
+                "runbook": "docs/alerts.md#pokeproxyslowprocessing"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "persistent cache failure",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "up{job=\"pokeproxy\",pod=\"proxy-one\"}",
+          "values": "1+0x20"
+        },
+        {
+          "series": "pokeproxy_cache_total{job=\"pokeproxy\",outcome=\"hit\"}",
+          "values": "0+80x15"
+        },
+        {
+          "series": "pokeproxy_cache_total{job=\"pokeproxy\",outcome=\"read_error\"}",
+          "values": "0+20x15"
+        }
+      ],
+      "alert_rule_test": [
+        {
+          "eval_time": "5m",
+          "alertname": "PokeProxyCacheErrors",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "6m",
+          "alertname": "PokeProxyCacheErrors",
+          "exp_alerts": [
+            {
+              "exp_labels": {
+                "severity": "warning",
+                "service": "pokeproxy"
+              },
+              "exp_annotations": {
+                "summary": "More than 10% of cache operations fail",
+                "runbook": "docs/alerts.md#pokeproxycacheerrors"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "low traffic suppresses error and latency ratios",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "up{job=\"pokeproxy\",pod=\"proxy-one\"}",
+          "values": "1+0x20"
+        },
+        {
+          "series": "pokeproxy_forward_total{job=\"pokeproxy\",rule=\"rule_0\",outcome=\"timeout\"}",
+          "values": "0+1x15"
+        },
+        {
+          "series": "pokeproxy_requests_total{job=\"pokeproxy\",outcome=\"internal_error\",status=\"500\"}",
+          "values": "0+1x15"
+        },
+        {
+          "series": "pokeproxy_request_duration_seconds_count{job=\"pokeproxy\"}",
+          "values": "0+1x15"
+        },
+        {
+          "series": "pokeproxy_request_duration_seconds_bucket{job=\"pokeproxy\",le=\"1.0\"}",
+          "values": "0+0x15"
+        },
+        {
+          "series": "pokeproxy_cache_total{job=\"pokeproxy\",outcome=\"read_error\"}",
+          "values": "0+1x15"
+        }
+      ],
+      "alert_rule_test": [
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyScrapeUnavailable",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyForwardingFailures",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyServerErrors",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxySlowProcessing",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyCacheErrors",
+          "exp_alerts": []
+        }
+      ]
+    },
+    {
+      "name": "invalid signatures unmatched and cold cache are not outages",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "up{job=\"pokeproxy\",pod=\"proxy-one\"}",
+          "values": "1+0x20"
+        },
+        {
+          "series": "pokeproxy_requests_total{job=\"pokeproxy\",outcome=\"invalid_signature\",status=\"401\"}",
+          "values": "0+100x15"
+        },
+        {
+          "series": "pokeproxy_requests_total{job=\"pokeproxy\",outcome=\"unmatched\",status=\"200\"}",
+          "values": "0+100x15"
+        },
+        {
+          "series": "pokeproxy_cache_total{job=\"pokeproxy\",outcome=\"miss\"}",
+          "values": "0+100x15"
+        },
+        {
+          "series": "pokeproxy_cache_total{job=\"pokeproxy\",outcome=\"write\"}",
+          "values": "0+100x15"
+        }
+      ],
+      "alert_rule_test": [
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyScrapeUnavailable",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyForwardingFailures",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyServerErrors",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxySlowProcessing",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyCacheErrors",
+          "exp_alerts": []
+        }
+      ]
+    },
+    {
+      "name": "idle healthy target is not an outage",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "up{job=\"pokeproxy\",pod=\"proxy-one\"}",
+          "values": "1+0x20"
+        }
+      ],
+      "alert_rule_test": [
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyScrapeUnavailable",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyForwardingFailures",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyServerErrors",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxySlowProcessing",
+          "exp_alerts": []
+        },
+        {
+          "eval_time": "10m",
+          "alertname": "PokeProxyCacheErrors",
+          "exp_alerts": []
+        }
+      ]
+    }
+  ]
+}

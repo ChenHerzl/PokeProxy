@@ -10,5 +10,6 @@
 !mock_service/**
 !scripts/
 !scripts/verify.py
+!scripts/load_generator.py
 **/__pycache__/
 **/*.pyc

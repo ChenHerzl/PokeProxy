@@ -150,6 +150,7 @@ async def stream(request: Request) -> Response:
     correlation = request_id(request)
     start = time.monotonic()
     stats = state.stats
+    stats.received.inc()
     status, outcome, admitted = 500, "internal_error", False
     try:
         if not state.ready:
@@ -182,6 +183,7 @@ async def stream(request: Request) -> Response:
         if rule is None:
             response, outcome = JSONResponse({}), "unmatched"
         else:
+            stats.rule_matches.labels(f"rule_{state.rules.index(rule)}").inc()
             response = await forward(request, rule, pokemon, len(body), correlation)
             outcome = (
                 "forwarded" if response.status_code < 400 else "downstream_http_error"

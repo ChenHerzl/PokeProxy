@@ -24,6 +24,6 @@ EXPOSE 8001
 CMD ["mock_service.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1", "--limit-concurrency", "32", "--timeout-graceful-shutdown", "15"]
 
 FROM runtime AS proxy
-COPY scripts/verify.py ./scripts/verify.py
+COPY scripts/verify.py scripts/load_generator.py ./scripts/
 EXPOSE 8000
 CMD ["pokeproxy.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--limit-concurrency", "32", "--timeout-graceful-shutdown", "30"]
