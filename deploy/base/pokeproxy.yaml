@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pokeproxy
+  labels: &id001
+    app.kubernetes.io/name: pokeproxy
+    app.kubernetes.io/part-of: pokeproxy
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  minReadySeconds: 5
+  progressDeadlineSeconds: 180
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels: *id001
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pokeproxy
+        app.kubernetes.io/part-of: pokeproxy
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: pokeproxy
+        image: pokeproxy:part2
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        envFrom:
+        - configMapRef:
+            name: pokeproxy-settings
+        env:
+        - name: POKEPROXY_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: pokeproxy-credentials
+              key: POKEPROXY_SECRET
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: pokeproxy-credentials
+              key: REDIS_URL
+        volumeMounts:
+        - name: rules
+          mountPath: /etc/pokeproxy
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 2
+          timeoutSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+          periodSeconds: 3
+          timeoutSeconds: 2
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+      volumes:
+      - name: rules
+        configMap:
+          name: pokeproxy-rules
+      - name: tmp
+        emptyDir:
+          sizeLimit: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pokeproxy
+  labels:
+    app.kubernetes.io/name: pokeproxy
+    app.kubernetes.io/part-of: pokeproxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: pokeproxy
+    app.kubernetes.io/part-of: pokeproxy
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http

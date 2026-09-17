@@ -44,6 +44,50 @@ uv run --frozen uvicorn pokeproxy.main:app --host 127.0.0.1 --port 8000 \
   --workers 1 --limit-concurrency 200 --timeout-graceful-shutdown 30
 ```
 
+## Local Kubernetes deployment (Part 2)
+
+Prerequisites: Docker running, kind, kubectl with Kustomize support, and Python 3.
+Run from this repository root. The cluster image is pinned in
+`infra/kind/cluster.yaml`. See [deployment decisions and verification](docs/planning/03-local-deployment.md).
+
+```bash
+mkdir -p .kube
+kind create cluster --config infra/kind/cluster.yaml --kubeconfig .kube/kind-config
+docker build --target proxy -t pokeproxy:part2 .
+docker build --target mock -t pokeproxy-mock:part2 .
+kind load docker-image --name pokeproxy pokeproxy:part2 pokeproxy-mock:part2
+python3 scripts/create_local_secret.py
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -f deploy/base/namespace.yaml
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -f .secrets/kubernetes-secret.json
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -k deploy/overlays/local
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy rollout status deployment/redis --timeout=180s
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy rollout status deployment/mock-downstream --timeout=180s
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy rollout status deployment/pokeproxy --timeout=180s
+```
+
+Skip cluster creation when the `pokeproxy` cluster already exists. Credentials
+are generated once and preserved on reruns; do not commit `.secrets` or `.kube`.
+Local image tags are for this demonstration. Rebuilding a tag does not restart
+existing Pods; reload images and restart the affected Deployment, or use a new
+image tag in the overlay.
+
+Run the bounded end-to-end verification (the delete permits repeated runs):
+
+```bash
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy delete job pokeproxy-verify --ignore-not-found
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy apply -k deploy/verification
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy wait --for=condition=complete job/pokeproxy-verify --timeout=90s
+kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy logs job/pokeproxy-verify
+```
+
+A failed wait is a failed verification; inspect Job logs and Pod events. The Job
+checks actual downstream receipts as well as Redis authentication and cache use.
+Services stay inside the cluster. For local access, run
+`kubectl --kubeconfig .kube/kind-config --context kind-pokeproxy -n pokeproxy port-forward service/pokeproxy 8000:8000`
+and visit `http://127.0.0.1:8000/ready`. Stop the forwarding with Ctrl-C.
+Teardown: `kind delete cluster --name pokeproxy`; this removes ephemeral cache
+and receipt data while keeping your ignored local credentials for reuse.
+
 ## Configuration
 
 ### Environment Variables

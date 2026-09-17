@@ -1,0 +1,72 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pokeproxy-verify
+  labels:
+    app.kubernetes.io/name: pokeproxy-verify
+    app.kubernetes.io/part-of: pokeproxy
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 60
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pokeproxy-verify
+        app.kubernetes.io/part-of: pokeproxy
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: verify
+          image: pokeproxy:part2
+          imagePullPolicy: IfNotPresent
+          command: [python, -c]
+          args:
+            - |
+              import base64, os
+              import httpx, redis
+              from scripts.verify import verify
+              cache = redis.Redis.from_url(os.environ['REDIS_URL'], socket_timeout=2, socket_connect_timeout=2)
+              assert cache.ping(), 'Redis DNS/authentication/PING failed'
+              cache.close()
+              secret = base64.b64decode(os.environ['POKEPROXY_SECRET'], validate=True)
+              for _ in range(2):
+                  print('Verified receipt:', verify('http://pokeproxy:8000', 'http://mock-downstream:8001', secret, 'strong fire pokemon'), flush=True)
+              with httpx.Client(timeout=3, trust_env=False) as client:
+                  ready = client.get('http://pokeproxy:8000/ready')
+                  ready.raise_for_status()
+                  assert ready.json()['cache'] == 'healthy', ready.text
+                  metrics = client.get('http://pokeproxy:8000/metrics')
+                  metrics.raise_for_status()
+                  assert 'pokeproxy_cache_total{outcome="hit"}' in metrics.text, 'Expected repeated-payload cache hit'
+              print('PASS: Service DNS, authenticated Redis, protobuf/HMAC, JSON receipts, readiness, cache hit and metrics', flush=True)
+          env:
+            - name: POKEPROXY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pokeproxy-credentials
+                  key: POKEPROXY_SECRET
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: pokeproxy-credentials
+                  key: REDIS_URL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 48Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

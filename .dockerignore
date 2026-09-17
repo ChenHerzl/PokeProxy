@@ -1,0 +1,14 @@
+# Allowlist: credentials, .git, caches, tests and local cluster files never enter context.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+!mock_service/
+!mock_service/**
+!scripts/
+!scripts/verify.py
+**/__pycache__/
+**/*.pyc
