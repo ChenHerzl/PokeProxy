@@ -1,0 +1,67 @@
+name: Promote release desired state
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Successful default-branch push CI run ID to promote
+        required: true
+        type: string
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+concurrency:
+  group: promote-release
+  cancel-in-progress: false
+jobs:
+  promote:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Fetch only a successful trusted CI artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.ci_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > "$RUNNER_TEMP/run.json"
+          jq -e --arg branch "$DEFAULT_BRANCH" --arg repo "$GITHUB_REPOSITORY" '
+            .conclusion == "success" and .event == "push" and
+            .head_branch == $branch and .head_repository.full_name == $repo and
+            .path == ".github/workflows/ci.yml"
+          ' "$RUNNER_TEMP/run.json"
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name release --dir "$RUNNER_TEMP/release"
+          SOURCE_SHA="$(jq -r .head_sha "$RUNNER_TEMP/run.json")"
+          python3 scripts/release.py "$RUNNER_TEMP/release/release.json" \
+            --repository "$GITHUB_REPOSITORY" --source-sha "$SOURCE_SHA"
+      - name: Open desired-state PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.ci_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if git diff --quiet -- deploy/overlays/release && test -z "$(git ls-files --others --exclude-standard deploy/overlays/release)"; then
+            echo 'Desired state already matches this release.'
+            exit 0
+          fi
+          BRANCH="promote/run-$RUN_ID-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git switch -c "$BRANCH"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add deploy/overlays/release
+          git commit -m "Promote verified CI run $RUN_ID"
+          git push origin "$BRANCH"
+          cat > "$RUNNER_TEMP/pr-body.md" <<'BODY'
+          Updates Git desired state to the immutable image digests produced by the selected successful CI run.
+
+          After review and merge, run the local reconciler. It applies this Git revision and gates success on real protobuf traffic and exact downstream receipts. See docs/rollback.md for failure recovery.
+
+          PRs created with GITHUB_TOKEN do not automatically trigger other workflows. Run CI manually on this branch (build-only, no publish), or close/reopen this PR as a maintainer before merging if required checks are configured.
+          BODY
+          gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+            --title "Promote CI run $RUN_ID" --body-file "$RUNNER_TEMP/pr-body.md"

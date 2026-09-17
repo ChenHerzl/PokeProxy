@@ -88,6 +88,40 @@ and visit `http://127.0.0.1:8000/ready`. Stop the forwarding with Ctrl-C.
 Teardown: `kind delete cluster --name pokeproxy`; this removes ephemeral cache
 and receipt data while keeping your ignored local credentials for reuse.
 
+## CI/CD and GitOps (Part 3)
+
+GitHub Actions [CI](.github/workflows/ci.yml) lints, runs tests with Redis, builds
+Python distributions and both container targets, and validates workflows and
+Kubernetes manifests. Default-branch pushes publish GHCR images tagged with the
+full source SHA plus a unique run/attempt suffix, and record their immutable digests.
+
+The separate [promotion workflow](.github/workflows/promote.yml) takes a successful
+CI run ID and opens a PR updating `deploy/overlays/release`. It does not deploy.
+After merging that PR, fetch Git and reconcile from the machine hosting kind:
+
+```bash
+git fetch origin
+python3 scripts/reconcile.py deploy --context kind-pokeproxy \
+  --kubeconfig .kube/kind-config --revision origin/main
+```
+
+Use `origin/master` if appropriate. The release overlay must first be populated
+by promotion; its bootstrap state intentionally cannot be reconciled. Keep the
+Part 2 application Secret provisioned, and make GHCR packages public for the demo
+or configure a registry pull Secret outside Git. The script uses committed
+manifests, waits for rollouts, sends real protobuf traffic, checks exact downstream
+receipts, and restores the last verified Git snapshot on failure.
+
+Run just the deployment gate with:
+
+```bash
+bash scripts/e2e-verify.sh --context kind-pokeproxy --kubeconfig .kube/kind-config
+```
+
+See [setup, stages, Argo CD integration and verification results](docs/planning/04-cicd-gitops.md)
+and [rollback behavior](docs/rollback.md). Argo CD is not installed; the local
+reconciler is the assignment's runnable deployment path. Parts 4–5 remain separate.
+
 ## Configuration
 
 ### Environment Variables

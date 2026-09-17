@@ -1,0 +1,6 @@
+# Promotion replaces this bootstrap configuration with SHA-tagged, digest-pinned images.
+# Reconciliation refuses this overlay until a validated release.json is committed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
