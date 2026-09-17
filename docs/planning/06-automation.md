@@ -257,3 +257,12 @@ correlated downstream receipts passed, and monitoring confirmed one healthy
 scrape target, five alert rules and 17 dashboard panels. The command exited 0
 and printed the expanded URL list. Full pytest: **116 passed, 1 skipped**;
 Ruff, shell syntax, actionlint and `git diff --check` passed.
+
+## Reviewer access follow-up
+
+`make tunnels` now starts all three managed background port-forwards and checks
+HTTP readiness. `make tunnels-down` stops only those processes using recorded
+PID/start-time/command identity and Linux pidfds. Logs and PID records live in
+`.local/tunnels/`; `make status` reports their state. `make up` remains deployment
+and verification only. Foreground access commands remain available. Stop managed
+tunnels explicitly before cluster teardown. See the [exact live test results](../verification/tunnels.md).

@@ -1,219 +1,208 @@
-# PokeProxy DevOps Assignment
+# PokeProxy — Production-Ready DevOps Take-Home
 
-## Overview
+PokeProxy validates HMAC-signed Pokémon protobuf messages, applies routing rules,
+and forwards matching data as JSON. This submission adds application hardening,
+reproducible Kubernetes deployment, CI/GitOps delivery, real-traffic verification
+and monitoring. **Production readiness is the engineering goal; the deployed stack
+is a local assignment environment, with explicit limitations below.**
 
-PokeProxy accepts HMAC-signed Pokémon protobuf messages at `POST /stream`, applies
-routing rules, and forwards matching Pokémon as JSON. This submission hardens the
-application and provides containers, local Kubernetes, CI/CD, deployment verification,
-rollback, monitoring, and a repeatable `make up` entry point.
+## At a glance
 
-For a 10–15 minute review, read this README, [rollback behavior](docs/rollback.md),
-and [alert rationale](docs/alerts.md). The [planning index](docs/planning/README.md)
-links implementation decisions and recorded evidence by phase.
+| Area | Implementation |
+| --- | --- |
+| Kubernetes | Single-node kind cluster |
+| Deployment | Kustomize manifests; Make/Python orchestration |
+| CI | GitHub Actions; lint, tests, builds and configuration validation |
+| CD / GitOps | Promotion PR updates Git; explicit local reconciler applies and verifies |
+| Monitoring | Prometheus + Grafana; dashboard and alert rules in Git |
+| Cache | Redis, used as a best-effort decoded-data cache |
+| Bootstrap / access / verification | `make up` / `make tunnels` / `make verify` |
+
+**Review path:** this guide → [rollback runbook](docs/rollback.md) →
+[alert rationale](docs/alerts.md). Detailed decisions and evidence are indexed in
+[planning](docs/planning/README.md).
 
 ## Architecture
 
-```text
-Client / verification Job
-         |
-         | POST /stream: protobuf + HMAC
-         v
-     PokeProxy --------------------> Redis
-         |                    best-effort decoded-data cache
-         | first matching rule
-         | JSON + correlation ID
-         v
-   Mock downstream <-------------- verification Job checks exact receipts
-
-     PokeProxy /metrics <--------- Prometheus <--------- Grafana
-                                     |
-                              five alert rules
-
-GitHub Actions CI -> GHCR images + release artifact
-                  -> promotion PR -> Git desired state
-                                     |
-                              local reconciler
-                                     |
-                              rollout + E2E gate
+```mermaid
+flowchart LR
+    C[Client / load generator / E2E Job] --> P[PokeProxy: POST /stream]
+    P --> H[HMAC validation]
+    H --> L[Cache lookup]
+    L <--> R[(Redis)]
+    L --> D[Use cached data or decode protobuf]
+    D --> Rules[Routing: first matching rule]
+    Rules -->|match: JSON| Mock[Mock downstream]
+    Rules -->|no match| OK[HTTP 200 empty object]
+    E[E2E receipt check] --> Mock
+    Prom[Prometheus] -->|scrapes /metrics| P
+    G[Grafana] -->|queries| Prom
 ```
 
-HMAC validation precedes cache access. A cache hit avoids decoding; it **still
-forwards**. Rule conditions use AND, and the first matching rule wins. A valid
-unmatched message returns HTTP 200 `{}` without a downstream call. A downstream
-attempt has a finite deadline and no automatic POST retry.
+HMAC is checked **before** Redis. Cache hits skip decoding but still forward;
+Redis is not delivery deduplication. Rule conditions use AND, with the first match
+winning. Downstream attempts have bounded deadlines and no automatic POST retry.
 
-## Repository structure
+## Quick Start
 
-| Path | Purpose |
-| --- | --- |
-| `src/pokeproxy/` | Application, routing, cache, lifecycle, metrics and generated protobuf bindings |
-| `mock_service/`, `config/`, `proto/` | Receipt-recording mock, native development rules and message schema |
-| `tests/` | Application, real-process, delivery, monitoring and automation regression tests |
-| `Dockerfile`, `uv.lock`, `pyproject.toml` | Separate proxy/mock image targets and locked Python dependencies |
-| `infra/kind/` | Pinned local Kubernetes cluster configuration |
-| `deploy/base/`, `deploy/overlays/` | Application manifests, manual local overlay and promoted release desired state |
-| `deploy/monitoring/`, `deploy/verification/` | Prometheus/Grafana, dashboard, alerts and E2E Job |
-| `.github/workflows/` | CI and separate desired-state promotion workflow |
-| `scripts/`, `Makefile` | Bootstrap, reconciliation, verification, load generation and validation |
-| `docs/issues/`, `docs/planning/`, `docs/verification/` | Findings/fixes, implementation records and evidence |
+### Prerequisites
 
-Generated `.local/`, `.kube/` and `.secrets/` directories are ignored by Git.
+- **Linux**, Docker Engine with Buildx, running and accessible to your user.
+- **2 CPUs / 4 GiB RAM** available to Docker; roughly **10 GiB disk** recommended.
+- GNU Make, Bash, Python **3.11+**, standard utilities including `timeout` and `flock`.
+- kind **v0.33.0**, kubectl **1.36.x**; internet access for uncached downloads.
 
-## Prerequisites
+If the Kubernetes CLIs are missing, explicitly run `make tools` (requires curl,
+sha256sum and install). It downloads checksum-verified binaries into `.local/bin`.
+No command installs system packages or uses sudo. `make doctor` checks prerequisites.
+Host uv, Redis and application Python packages are not needed for bootstrap.
 
-- Linux x86_64 or aarch64; Docker Engine with Buildx running and accessible to your user.
-- At least **2 CPUs / 4 GiB RAM** available to Docker; approximately **10 GiB free disk** recommended.
-- GNU Make, Bash, Python **3.11+**, standard Linux utilities including `timeout` and `flock`.
-- kind **v0.33.0** and kubectl **1.36.x**. If missing, `make tools` explicitly downloads
-  checksum-verified pinned binaries into `.local/bin`; it requires curl, sha256sum and install.
-- Internet access for initial tool/image/dependency downloads.
-
-Install host prerequisites using your normal OS setup. No target installs system
-packages or uses sudo. `make doctor` checks prerequisites without creating a cluster.
-Host uv, Redis, application Python packages and registry credentials are not needed
-for `make up`. Linux x86_64 was tested; ARM64 was not exercised.
-
-## Quick start
+### Deploy and open local access
 
 From the repository root:
 
 ```bash
 make up
+make tunnels
 ```
 
-If Kubernetes CLIs are missing, run `make tools` first. Bootstrap checks prerequisites,
-creates or starts the `pokeproxy` kind cluster, builds/loads both images, provisions
-local credentials, deploys Redis/mock/proxy and monitoring, waits for readiness,
-and runs E2E and monitoring gates. Any failed step returns non-zero.
+`make up` creates/starts kind, builds and loads application images, preloads pinned
+Redis/monitoring images through host Docker, preserves local credentials, deploys
+all five workloads, waits for readiness and runs application/monitoring gates.
+It is safe to rerun and **does not start background tunnels**.
 
-It is safe to rerun: unchanged image content/configuration preserves workload
-Pods, and credentials are retained. Access services in separate terminals:
+`make tunnels` starts three localhost-only background port-forwards, checks HTTP
+readiness and returns your terminal. Repeated calls reuse healthy managed processes.
 
-| Command | Local URL |
+| Service | URL |
 | --- | --- |
-| `make grafana` | http://127.0.0.1:3000/d/pokeproxy-health — anonymous Viewer |
-| `make prometheus` | http://127.0.0.1:9090 — targets, queries and alerts |
-| `make proxy` | http://127.0.0.1:8000/ready |
+| Grafana health dashboard | http://127.0.0.1:3000/d/pokeproxy-health — Viewer, no login |
+| Prometheus | http://127.0.0.1:9090 |
+| Targets / alerts | http://127.0.0.1:9090/targets · http://127.0.0.1:9090/alerts |
+| PokeProxy readiness / health | http://127.0.0.1:8000/ready · http://127.0.0.1:8000/health |
+| Application metrics / statistics | http://127.0.0.1:8000/metrics · http://127.0.0.1:8000/stats |
 
-Tunnels bind localhost and run until Ctrl-C. `make help` lists all helpers.
-After `make proxy`, test `/health`, `/ready`, `/metrics` and `/stats` at
-`http://127.0.0.1:8000`. After `make prometheus`, inspect
-http://127.0.0.1:9090/targets and http://127.0.0.1:9090/alerts.
-These URLs require their tunnel; `make up` prints them but does not start
-background port-forwards. Use `make verify` for signed `/stream` traffic.
-
-Infrastructure images (Redis, Prometheus and Grafana) are also loaded through
-host Docker, preserving the pinned references. This avoids dependence on registry
-DNS inside kind nodes; host Docker still needs network access for uncached images.
+Logs and process records live in `.local/tunnels/{proxy,prometheus,grafana}.{log,pid}`.
+Occupied ports fail clearly; unrelated processes are left alone. If a rollout
+interrupts access, rerun `make tunnels`. Foreground helpers `make proxy`,
+`make prometheus` and `make grafana` remain available; do not run them on the same
+ports as managed tunnels.
 
 ## Verification
 
 ```bash
-make status       # five Deployments should be available 1/1
-make verify       # real traffic + downstream receipts + monitoring checks
-make logs         # follow proxy logs; Ctrl-C to stop
+make status
+make verify
+curl -fsS http://127.0.0.1:8000/ready
+curl -fsS http://127.0.0.1:9090/-/ready
 ```
 
-`make verify` prints PASS only after the application gate and monitoring gate
-succeed. An HTTP health check alone does not prove delivery. After `make proxy`,
-`curl -fsS http://127.0.0.1:8000/ready` checks readiness independently.
+**`make verify` proves delivery, not just HTTP availability.** A bounded Kubernetes
+Job signs a fixed matching protobuf payload, sends it twice through the PokeProxy
+Service, and verifies exact Pokémon JSON, routing reason and unique correlation
+IDs in mock receipts. It checks authenticated Redis/cache reuse and application
+metrics. The monitoring gate checks scraping, traffic metrics, alert rules,
+Grafana provisioning and its datasource. Failure exits non-zero.
 
-Optional developer checks require uv and synchronize locked dependencies:
+With uv installed, `make lint` and `make test` run developer checks. For 60 seconds
+of synthetic traffic plus an intentional HMAC rejection:
 
 ```bash
-make lint
-make test
+uv run --frozen python scripts/verify_monitoring.py \
+  --context kind-pokeproxy --kubeconfig .kube/kind-config
 ```
 
-Recorded local results: **114 passed, 1 skipped** (optional host Redis TTL fixture),
-successful fresh-cluster `make down` → `make up`, successful second `make up` with
-all five workload Pod UIDs unchanged, and a final passing `make verify`.
-[Automation evidence](docs/planning/06-automation.md#validation-and-ai-assisted-flow)
-records commands and environmental assumptions. Earlier CI-equivalent tests ran
-with a real Redis fixture; [delivery evidence](docs/planning/04-cicd-gitops.md#local-validation-and-ai-assisted-flow)
-distinguishes those results from hosted workflows, which were not executed here.
+### Recorded evidence
 
-## Teardown
+| Check | Observed result |
+| --- | --- |
+| Fresh-cluster bootstrap, then repeated `make up` | Passed; five workload Pod UIDs unchanged on rerun |
+| Subsequent registry-DNS failure recovery | Host image preload restored Redis; `make up` passed both gates |
+| Tunnel start / second start | Three HTTP checks passed; same PIDs reused |
+| Tunnel shutdown / repeated shutdown | Passed; all three ports closed and PID records removed |
+| Application/delivery/monitoring evidence | [Phase records](docs/planning/README.md), [monitoring result](docs/verification/part-4.json) |
+
+Exact tunnel commands/results and regression counts are in
+[tunnel verification](docs/verification/tunnels.md). **Hosted Actions publication,
+GHCR push and promotion PR creation were not executed here.** Their local equivalents
+and delivery failure/recovery were tested; see [CI/CD evidence](docs/planning/04-cicd-gitops.md).
+
+## Teardown and useful commands
 
 ```bash
+make tunnels-down
 make down
 ```
 
-Deletes only the named kind cluster; repeated teardown succeeds. Cluster data,
-including mock receipts and monitoring history, is ephemeral. Local credentials,
-downloaded CLIs and Docker caches remain for reuse. No unrelated Docker resources
-are pruned.
+Tunnel cleanup checks recorded process identity, stops only checkout-managed
+port-forwards and removes stale PID files. Cluster teardown deletes the named
+`pokeproxy` kind cluster and ephemeral data; credentials, logs, tools and Docker
+caches remain. `make down` does not manage tunnels—stop them explicitly as above.
+
+| Command | Purpose |
+| --- | --- |
+| `make help` / `make doctor` | Discover targets / check prerequisites |
+| `make status` / `make logs` | Workload and managed tunnel status / follow proxy logs |
+| `make build` | Build proxy/mock images |
+| `make verify` | Repeat application and monitoring gates |
+| `make tunnels` / `make tunnels-down` | Open / close managed local access |
 
 ## Application hardening
 
-The [issue index](docs/issues/README.md) links each original problem, fix and test:
+The [issue records](docs/issues/README.md) explain each defect, fix and test:
 
-- Bounded uploads, downstream responses, concurrency and dependency deadlines;
-  pooled HTTP connections without unsafe automatic retries.
-- Direct Redis lookups, validated cache entries and bounded fallback when Redis fails.
-- Startup validation of HMAC configuration and routing rules; corrected protobuf compatibility.
-- Correct HTTP framing, filtered hop-by-hop metadata and isolated cookies/headers.
-- Bounded latency histograms, consistent request accounting and safe structured logs.
-- Graceful shutdown/client cleanup, bounded mock receipts and correlated real-traffic verification.
+- Bounded uploads, responses, concurrency, dependency timeouts and shutdown.
+- Pooled HTTP connections, correct framing and header/cookie isolation.
+- Direct Redis lookup, cache validation and nonfatal bounded cache failures.
+- Startup validation of routing/HMAC settings and compatible protobuf dependencies.
+- Bounded metrics, consistent accounting, safe structured logs and correlated receipts.
 
-Configuration is documented in [.env.example](.env.example) and the
-[hardening record](docs/planning/02-production-hardening.md). Kubernetes budgets
-are explicit in [pokeproxy.env](deploy/base/pokeproxy.env). Rules load at startup;
-configuration changes require a rollout. `/health` checks the process; `/ready`
-checks initialization and reports the last cache-operation state, not continuous
-Redis connectivity. Cache/downstream outages do not fail liveness.
+Rules load at startup; changes require a rollout. `/health` checks the process;
+`/ready` checks initialization and reports the last cache-operation state, not a
+continuous connectivity probe. Dependency outages do not fail liveness.
+See [hardening decisions](docs/planning/02-production-hardening.md),
+[environment settings](.env.example) and [deployment budgets](deploy/base/pokeproxy.env).
 
-## Containerization
+## Containers and Kubernetes
 
-The [multi-stage Dockerfile](Dockerfile) uses digest-pinned Python 3.13 and uv,
-installs locked runtime dependencies, and produces `proxy` and `mock` targets.
-Runtime images run as UID 10001 with one Uvicorn worker and finite shutdown budgets.
-Dependency layers precede source copying for useful build caching.
+The [multi-stage Dockerfile](Dockerfile) uses digest-pinned Python/uv and locked
+runtime dependencies, producing separate proxy/mock targets running as UID 10001.
+Each uses one Uvicorn worker with finite shutdown budgets. Dependency layers are
+cached independently of source changes.
 
-`make build` builds both targets. Local bootstrap tags images using their full Docker
-image IDs and loads them into kind. CI uses source-SHA/run/attempt tags and records
-registry manifest digests; release deployments select those digests. These are
-separate local-development and release paths.
+[Kustomize manifests](deploy/base/) deploy proxy, mock and Redis into `pokeproxy`;
+Prometheus/Grafana run in `monitoring`. ClusterIP Services keep access internal.
+Workloads have resource budgets, probes and security contexts: non-root execution,
+read-only root filesystems, dropped capabilities and no privilege escalation.
+Prometheus has scoped discovery RBAC; application Pods do not mount API tokens.
+Configuration hashes trigger rollouts. Secrets stay outside Git.
 
-## Kubernetes architecture
-
-[Application manifests](deploy/base/) contain three single-replica Deployments
-and ClusterIP Services in `pokeproxy`; Prometheus/Grafana run in `monitoring`.
-Kustomize generates configuration hashes to trigger rollouts when settings change.
-Secrets are provisioned outside Git.
-
-Workloads define requests/limits, startup/readiness/liveness probes and termination
-budgets. Containers use non-root identities, read-only root filesystems, dropped
-capabilities and restricted privilege escalation. Application Pods do not mount
-API tokens; Prometheus has scoped discovery RBAC. Redis and monitoring storage
-are ephemeral. There is no ingress, TLS termination or NetworkPolicy enforcement
-in this local assignment. See [infrastructure decisions](docs/planning/03-local-deployment.md).
+Local images use content-derived tags and kind loading. Release images use
+source-SHA/run/attempt tags **plus registry digests**. Storage is ephemeral; there
+is no ingress, TLS termination or enforced NetworkPolicy in this demo.
+[Infrastructure rationale](docs/planning/03-local-deployment.md).
 
 ## CI pipeline
 
-[GitHub Actions CI](.github/workflows/ci.yml) runs on PRs, pushes to main/master,
-and manual dispatch:
+[GitHub Actions](.github/workflows/ci.yml) performs:
 
-1. Checkout; configure Python 3.13 and pinned uv with dependency caching.
-2. Ruff lint and pytest, including Redis TTL and real HTTP process tests.
-3. Build wheel/source distribution.
-4. Validate workflow/shell syntax, rendered Kubernetes schemas, Prometheus rules
-   and dashboard JSON; run alert-rule scenarios.
-5. Build both container targets using BuildKit caches.
-6. On default-branch pushes, publish GHCR images with
-   `sha-<full-git-sha>-<run-id>-<attempt>` tags and upload digest-bearing `release.json`.
+1. Checkout and configure pinned Python/uv; restore dependency cache.
+2. Ruff and pytest, including real Redis and HTTP-process checks.
+3. Build wheel/source distribution; validate workflows, shell, Kubernetes schemas,
+   Prometheus rules and dashboard JSON, including alert-rule scenarios.
+4. Build both container targets with BuildKit caches.
+5. On default-branch pushes, publish GHCR images tagged
+   `sha-<full-sha>-<run-id>-<attempt>` and upload digest-bearing `release.json`.
 
-Actions are pinned by commit. Credentials use scoped `GITHUB_TOKEN` references,
-not literal secrets in YAML. PR/manual builds do not publish images. Hosted
-publication and promotion require configuring this repository on GitHub and
-were not executed in the local validation environment.
+Actions are commit-pinned. Scoped `GITHUB_TOKEN` references supply credentials;
+there are no literal credentials in workflow YAML. PR/manual builds do not publish.
 
-## CD / GitOps flow
+## CD / GitOps and rollback
 
-1. Dispatch [promotion](.github/workflows/promote.yml) with a successful default-branch
-   CI run ID. It verifies provenance and opens a PR updating `deploy/overlays/release`.
-2. Review/merge the desired-state PR. The workflow does not access the cluster.
-3. On the cluster host, fetch Git and explicitly reconcile the committed revision:
+**CI produces artifacts → promotion updates Git → reconciliation deploys.**
+
+The separate [promotion workflow](.github/workflows/promote.yml) validates a successful
+CI run and opens a PR changing `deploy/overlays/release`. After review and merge:
 
 ```bash
 git fetch origin
@@ -221,145 +210,84 @@ python3 scripts/reconcile.py deploy --context kind-pokeproxy \
   --kubeconfig .kube/kind-config --revision origin/main
 ```
 
-Use the repository's actual default branch. The release overlay starts as an
-intentional placeholder: promote a real release before reconciliation. Application
-Secrets must already exist; GHCR packages must be readable publicly or through an
-externally provisioned pull Secret. GitHub must permit Actions to create PRs;
-PRs created with `GITHUB_TOKEN` need the documented manual check trigger.
-[Complete setup](docs/planning/04-cicd-gitops.md) covers these requirements.
+Use the actual default branch. The release overlay is initially a placeholder;
+first promote real images. Provision application Secrets and registry access
+outside Git. GitHub must allow Actions-created PRs; those PRs need the documented
+manual check trigger. [Setup and release instructions](docs/planning/04-cicd-gitops.md).
 
-Argo CD is deliberately not installed. This lightweight reconciler reads desired
-state from Git but does not continuously correct drift. Argo would replace it,
-watch the release overlay and run the verification Job as a PostSync hook. Never
-run both deployment writers. `make up` builds the current working tree and refuses
-to overwrite a cluster with a recorded GitOps release.
+The reconciler applies a committed snapshot, waits and runs the E2E gate. It records
+the last verified Git revision and image digests. On a later deployment failure it
+restores and re-verifies that snapshot, **still returning failure for the attempted
+release**. A Git revert/fix makes recovery durable; first-release failure has no
+fallback. Secrets, data and downstream side effects are not rolled back, and
+obsolete resources are not pruned. [Rollback runbook](docs/rollback.md).
 
-## Post-deploy verification
-
-```bash
-bash scripts/e2e-verify.sh --context kind-pokeproxy --kubeconfig .kube/kind-config
-```
-
-The gate launches a bounded Kubernetes Job using the deployed proxy image and
-Secret. It signs a fixed matching protobuf payload, sends it twice through the
-PokeProxy Service, and checks the mock for exact Pokémon JSON and routing reason
-under unique request IDs. It also checks authenticated Redis, cache reuse,
-readiness and application metrics. It does not clear shared mock history.
-Failure or timeout exits non-zero. `make verify` additionally checks Prometheus
-scraping/traffic metrics, loaded alerts, Grafana's dashboard and datasource.
-
-## Rollback strategy
-
-After a release passes rollout and E2E, the reconciler records the verified Git
-revision and image digests in `pokeproxy-release-state`. A failed subsequent
-release reapplies that Git snapshot, waits, and re-verifies it. The attempted
-release still exits non-zero and is blocked from automatic reapplication.
-
-An operator must revert/fix desired state in Git for durable recovery. A first
-release has no fallback; failed recovery, interrupted reconciliation, secret
-rotation and downstream side effects require intervention. No data rollback or
-resource pruning occurs. `make up` failures retain resources for diagnosis and
-do **not** invoke release rollback. With Argo, a live rollback alone would be
-reverted by reconciliation; repair Git, and use one controller. See the
-[rollback runbook](docs/rollback.md) for exact steps and limits.
+Argo CD is not installed. It would replace the explicit local reconciler, watch the
+same overlay and run verification as a PostSync hook. That hook alone would not
+create a Git revert. Do not run competing writers. `make up` uses the working tree,
+does not perform release rollback and refuses a cluster with recorded GitOps state.
 
 ## Observability
 
-`/metrics` exposes counters for received/completed requests, HMAC/input rejection
-outcomes, rule matches, downstream outcomes and Redis hit/miss/error/write outcomes;
-histograms measure handler and downstream latency. An in-flight gauge measures
-admitted work. Labels use bounded outcomes/statuses/rule indices, never payloads,
-URLs or request IDs. Handler latency excludes response transmission.
-
-[Prometheus](deploy/monitoring/prometheus/) discovers proxy Pods and evaluates five
-alerts. [Grafana's 17-panel dashboard](deploy/monitoring/grafana/pokeproxy.json)
-answers “Is PokeProxy healthy right now?” with traffic, failures, latency, cache,
-scrape health and process CPU/RSS. It does not claim whole-cluster resource coverage.
-
-[Alerts](docs/alerts.md) cover unavailable scraping, forwarding failures, server
-errors, slow processing and cache errors, with thresholds, windows and operator
-actions. Ratio alerts require sufficient traffic; individual invalid signatures,
-normal cache misses and unmatched messages are intentionally not paged.
-Alertmanager/notification delivery is not installed.
-
-For a deeper check with 60 seconds of generated traffic and an intentional HMAC
-rejection (requires uv), run:
-
-```bash
-uv run --frozen python scripts/verify_monitoring.py \
-  --context kind-pokeproxy --kubeconfig .kube/kind-config
-```
-
-See [metric semantics and load evidence](docs/planning/05-observability.md) and the
-[recorded monitoring result](docs/verification/part-4.json).
-
-## Security considerations
-
-Local HMAC/Redis/Grafana credentials are generated once, stored in ignored private
-files, and preserved or recovered on reruns; mismatches fail rather than silently
-rotate credentials. Kubernetes Secrets are not encrypted merely because their
-values are base64 encoded. The public `.env.example` key is for native development
-only; bootstrap generates its own credentials.
-
-HMAC authenticates payloads but does not prevent replay. Redis writers and routing
-configuration remain trusted. Logs omit payloads, signatures, credentials and raw
-destination URLs. Keep metrics, mock administration and Grafana private: anonymous
-Viewer access and plaintext internal traffic are local conveniences, not public
-service security. Port-forward access requires authorized Kubernetes credentials.
-
-## Design decisions and trade-offs
-
-| Decision | Reason / cost |
+| Signal | Meaning |
 | --- | --- |
-| kind + Kustomize + Make | Small reproducible local stack; no cloud account, Terraform state or Helm dependency |
-| Best-effort Redis cache | Forwarding survives cache failure; cache is not delivery deduplication |
-| No automatic POST retries | Avoids hidden duplicate delivery; caller retries can still duplicate side effects |
-| Manual Git reconciler | Demonstrates promotion, gating and recovery without Argo's local overhead; no continuous drift correction |
-| Lightweight monitoring | Useful application signals without an operator/exporter stack; limited infrastructure visibility |
-| Single worker and replicas | Predictable process-local counters/receipts; no HA or multi-worker aggregation claim |
+| Request counters | Received/completed handlers and outcomes, including HMAC/input rejection |
+| Routing/forwarding counters | First matches and downstream success/failure |
+| Cache counters | Hits, misses, reads/writes and errors |
+| Histograms | Handler and downstream latency; handler duration excludes response transmission |
+| Gauges/process metrics | Admitted in-flight work, process CPU/RSS |
 
-## Production vs local assignment environment
+Labels use bounded outcomes/statuses/rule indices, never payloads or request IDs.
+[Prometheus](deploy/monitoring/prometheus/) scrapes proxy Pods. The
+[17-panel Grafana dashboard](deploy/monitoring/grafana/pokeproxy.json) shows traffic,
+failures, latency, cache behavior and scrape/process health.
 
-Production would need a managed or resilient multi-node cluster, measured capacity,
-multiple proxy replicas, disruption/topology policy and enforced network boundaries.
-Replace local credentials with managed secret delivery/rotation, add TLS and proper
-operator authentication, and use a controlled release reconciler such as Argo CD.
+[Five alerts](docs/alerts.md) cover unavailable scraping, forwarding failures, server
+errors, slow processing and cache errors. Each documents thresholds, windows and
+operator action. Individual invalid signatures, normal misses and unmatched
+messages deliberately do not page. Alertmanager/notifications and whole-cluster
+resource monitoring are not installed.
 
-Retain immutable release artifacts and deployment audit history; add image scanning,
-provenance/signing and policy enforcement. Define SLOs from real traffic, tune alerts,
-route notifications, add cluster resource monitoring and durable monitoring storage.
-Redis availability/persistence should reflect its cache-only contract. Replace the
-mock with actual downstream integration tests and a documented delivery/idempotency
-contract before claiming reliable business delivery.
+## Security, trade-offs and limitations
 
-## Known limitations
+| Local choice / limitation | Production direction |
+| --- | --- |
+| Generated private local credentials; Kubernetes Secrets | Managed secret delivery/rotation and encryption policy |
+| Anonymous Grafana Viewer, localhost tunnels, plaintext cluster traffic | Operator authentication, TLS and enforced network boundaries |
+| One node, one replica, ephemeral storage | Resilient cluster, measured capacity, appropriate persistence and disruption policy |
+| HMAC without replay protection; no automatic POST retries | Explicit downstream idempotency and replay contract |
+| Best-effort Redis decode cache | Availability sized to cache semantics; trusted/restricted writers |
+| Manual reconciliation, host-local lock, no pruning | One continuous controller, retained audit history and reviewed rollback policy |
+| Demonstration alert thresholds | Measured SLOs, notification routing and independent monitoring |
 
-- One-node local cluster, ephemeral state; no HA, disaster-recovery or production capacity validation.
-- No replay protection/exactly-once delivery; timeout can follow downstream acceptance.
-- Single-process mock receipts are bounded and can be evicted; one fixed E2E route
-  does not prove every rule or sustained throughput.
-- Local reconciler has a host-local lock, no pruning and no continuous controller;
-  monitoring does not automatically trigger rollback.
-- Metrics reflect application-handler work, excluding server-level rejection before
-  the handler; process RSS is not Pod memory/CPU throttling coverage.
-- Hosted Actions/GHCR/promotion were not run here. Live rollback testing restored
-  configuration using the same images; additional failure branches have unit coverage.
-- Bootstrap reused Docker caches and local credentials after deleting the cluster;
-  a pristine OS, ARM64 and stopped-node recovery were not separately tested.
+A timeout may follow downstream acceptance, so caller retries can duplicate side
+effects. Mock receipts are bounded and process-local; one E2E route is not full
+route coverage or a throughput test. Metrics omit server-level rejection before
+the handler; process RSS is not Pod resource coverage.
 
-## Future improvements
+The public `.env.example` key is for native development only. Bootstrap generates
+its own credentials and refuses silent rotation. Base64-encoded Secrets are not
+inherently encrypted. Logs omit payloads, signatures and credential values.
 
-Prioritize downstream idempotency/replay policy, continuous Git reconciliation with
-a reviewed Git-revert mechanism, supply-chain checks, and realistic load/SLO tests.
-Add production networking, secrets and alert delivery when a target environment
-exists; expand route coverage and multi-replica tests before scaling the service.
+Linux x86_64 was tested; ARM64, a pristine OS and stopped-node recovery were not
+separately exercised. Bootstrap tests retained Docker caches/local credentials.
+Live rollback tests changed configuration using the same images; other failure
+branches have unit coverage. Future priorities are realistic load/route coverage,
+supply-chain scanning/signing, production networking/secrets and continuous Git
+reconciliation—not additional local infrastructure for its own sake.
 
-## Planning / implementation process
+## Repository and implementation process
 
-Development was AI-assisted: repository inspection, proposed changes, implementation,
-tests and documentation were performed through an interactive coding assistant.
-The [planning index](docs/planning/README.md) lists phases 01–06, prompt categories,
-recorded decisions and validation limits. Historical assessments describe their
-original point in time; they are not the current completion checklist. This final
-pass reviewed source, manifests, workflows and existing evidence and reorganized
-documentation without adding application features.
+| Path | Contents |
+| --- | --- |
+| `src/pokeproxy/`, `mock_service/`, `proto/` | Application, mock and schema |
+| `tests/`, `scripts/`, `Makefile` | Regression coverage, verification and operational entry points |
+| `infra/kind/`, `deploy/` | Cluster, application/monitoring manifests and release overlays |
+| `.github/workflows/` | CI and desired-state promotion |
+| `docs/issues/`, `docs/planning/`, `docs/verification/` | Findings/fixes, decisions and recorded evidence |
+
+Development was **AI-assisted** through interactive repository analysis,
+implementation, testing and documentation. The [chronological planning index](docs/planning/README.md)
+links phases 01–06 and summarizes prompt categories, including final review.
+Historical assessments describe their point in time; recorded checks distinguish
+what ran locally from untested remote operations.

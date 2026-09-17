@@ -122,7 +122,8 @@ verify_stack() {
 access() {
   cat <<'TEXT'
 
-PokeProxy and monitoring are ready. Run each tunnel in a separate terminal:
+PokeProxy and monitoring are ready. Run make tunnels for all local URLs.
+Or run each foreground tunnel in a separate terminal:
   make grafana     -> http://127.0.0.1:3000/d/pokeproxy-health (Viewer, no login)
   make prometheus  -> http://127.0.0.1:9090 (targets and alerts)
   make proxy       -> http://127.0.0.1:8000/ready
@@ -153,10 +154,12 @@ make tools       Explicitly download pinned kind/kubectl into .local/bin; no sys
 make doctor      Check bootstrap prerequisites and Docker access
 make build       Build both images and generate a local overlay with content-derived tags
 make verify      Run real-traffic E2E and check monitoring (no host Python packages required)
-make status      Show application and monitoring workloads
+make status      Show workloads and managed tunnel status
 make logs        Follow the proxy logs
 make grafana     Forward Grafana to localhost:3000
 make prometheus  Forward Prometheus to localhost:9090
+make tunnels     Start all three managed background tunnels
+make tunnels-down Stop only checkout-managed tunnels
 make proxy       Forward PokeProxy to localhost:8000
 make test        Run pytest via uv (additional prerequisite)
 make lint        Run Ruff via uv (additional prerequisite)
@@ -224,6 +227,7 @@ case "$ACTION" in
   build) build_images ;;
   verify) basic_checks; lock_operation; verify_stack ;;
   status)
+    python3 scripts/tunnels.py status
     timeout 30 "${KUBE[@]}" -n pokeproxy get deployments,pods,services,jobs
     timeout 30 "${KUBE[@]}" -n monitoring get deployments,pods,services ;;
   logs) exec "${KUBE[@]}" -n pokeproxy logs deployment/pokeproxy --tail=100 -f --request-timeout=0 ;;
